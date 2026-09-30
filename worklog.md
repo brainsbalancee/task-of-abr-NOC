@@ -1,0 +1,225 @@
+# Helpdesk AI — Worklog
+
+Project: Customer support helpdesk with two surfaces (customer + staff).
+Time box: 6 hours of work.
+
+## Architecture overview
+
+- **Stack**: Next.js 16 (App Router) + TypeScript + Prisma/SQLite + shadcn/ui
+- **Two surfaces**:
+  - Customer surface (unauthed, open to public): ticket submit, ticket status lookup, AI chatbot
+  - Staff surface (authed): ticket queue, ticket detail, reply, AI-suggested draft
+- **AI features** (z-ai-web-dev-sdk, backend only):
+  - Customer chatbot for self-service (LLM)
+  - Staff AI draft-suggestion (LLM)
+- **Real-time**: polling (no WebSocket — kept minimal for time box)
+- **Security**: input sanitization, rate limiting, signed session tokens for ticket lookup, staff auth
+
+---
+
+Task ID: 1
+Agent: main (orchestrator)
+Task: Foundation — Prisma schema, db push, rate-limit lib, validation, seed data, staff auth lib
+
+Work Log:
+- Read existing project structure (Next.js 16, shadcn/ui all present, Prisma configured, sqlite)
+- Define Prisma schema: Customer, Ticket, TicketMessage, StaffUser, AuditLog
+- Run `bun run db:push`
+- Write `src/lib/rate-limit.ts` (in-memory token bucket, per-IP)
+- Write `src/lib/sanitize.ts` (strip HTML, enforce length, escape for safe render)
+- Write `src/lib/auth.ts` (staff session cookie, signed token)
+- Write `src/lib/ai.ts` (z-ai-web-dev-sdk wrapper for chat + draft)
+- Seed: 1 staff user, 3 sample tickets with messages
+
+Stage Summary:
+- Schema: Customer (email, name), Ticket (subject, body, status, priority, customerEmail, token for lookup), TicketMessage (authorRole: customer/staff/ai, body), StaffUser (email, passwordHash), AuditLog
+- Customer token: signed `cuid` returned on submit; needed to view ticket status (unguessable)
+- Staff: email+password, bcrypt-free (use scrypt), session via httpOnly cookie
+- Rate limit: 5 req/min on ticket submit, 10/min on chat, default 60/min
+
+---
+Task ID: 2-a
+Agent: full-stack-developer (customer surface)
+Task: Build customer-facing portal UI (3 tabs) + 3 customer API routes with security hardening
+
+Work Log:
+- Read worklog + all `src/lib/*.ts` + `prisma/schema.prisma` + `src/app/page.tsx` + shadcn primitives to confirm contract before writing code.
+- Created `src/components/customer/types.ts` with shared types (TicketDetail, ChatMessage, SubmitResult, ChatResult, FieldErrors, role/category/priority/status unions) so the UI stays in sync with the API contract.
+- Created `src/app/api/tickets/route.ts` (POST submit):
+  - Rate limit via `RATE_LIMITS.ticketSubmit`, key `ip:submit:${ip}`; `cleanupRateLimitMap()` after.
+  - Body parsed defensively (rejects non-object / invalid JSON with 400).
+  - `validateTicketInput` for subject/body/email/name; on validation failure returns 422 with per-field `fields` map.
+  - `category` and `priority` validated server-side against fixed enum sets; falls back to defaults rather than trusting client strings.
+  - `generateTicketRef()` + `generateLookupToken()` for unguessable handles.
+  - Customer upsert by email + Ticket create + system "Ticket created by customer." message written in a single `db.$transaction` (no orphan tickets).
+  - Returns 201 `{ref, lookupToken}`; 500 on any unexpected error with a generic message — no DB internals leaked.
+- Created `src/app/api/tickets/lookup/route.ts` (GET single ticket):
+  - Rate limit via `RATE_LIMITS.ticketLookup`, key `ip:lookup:${ip}`.
+  - Same 404 response (`{ok:false, error:"We couldn't find a ticket with those details."}`) whether the ref is missing OR the token is wrong — prevents enumeration.
+  - Token compare uses `constantTimeEqual` from `@/lib/auth` (wraps `crypto.timingSafeEqual`). If lengths differ, the helper returns false and we still return the same 404.
+  - Returns ticket detail + messages (oldest first) with `lookupToken`, `customerEmail` of other customers, `assigneeId`, and any staff-only fields omitted.
+  - Does NOT return other tickets by the same email — that would require email verification we don't have in this build.
+  - **Bug found & fixed mid-task**: original implementation cached a `NOT_FOUND` Response at module level — worked on the first request but sent an empty body on every subsequent request (Next.js reads the body stream once). Refactored to a `notFound()` factory that builds a fresh `Response` per call. Documented the trap in `agent-ctx/2-a-customer-surface.md`.
+- Created `src/app/api/chat/route.ts` (POST AI chatbot):
+  - Rate limit via `RATE_LIMITS.aiChat`, key `ip:chat:${ip}`.
+  - Body must be `{messages: [{role, content}, ...]}` array of 1..20 messages; content capped at 2000 chars.
+  - `role` must be `user` or `assistant` — any `system` messages sent by the client are silently dropped (never trust client-supplied system prompts). Verified via curl: a malicious system message is ignored, AI replies normally.
+  - Calls `chatReply(messages)` from `@/lib/ai`. On null return (AI unavailable / SDK error), returns `{ok:true, data:{reply:null, error:'unavailable'}}` so the client can show a graceful fallback.
+- Created `src/components/customer/customer-portal.tsx` — the 3-tab customer surface:
+  - Top-level `CustomerPortal` holds tab state + lifted `prefill` (ref+token) state so the submit tab can hand off to the lookup tab via the "View my ticket" button. Lookup form is keyed by `lookupNonce` to force a remount with new defaults and re-trigger its auto-fetch effect.
+  - **Tab 1 (Submit)**: react-hook-form + zod client-side validation mirroring server limits (`LIMITS` from sanitize.ts). Live character counters on subject + body. Category/priority via shadcn Select (state held locally, validated server-side too). On 201, swaps to a success card showing `ref` in big mono text, the `lookupToken`, an unambiguous "save this token — we don't email it" warning, and copy-to-clipboard buttons. Inline 422 field errors clear on edit. 429 renders a live countdown via `<RetryCountdown>`.
+  - **Tab 2 (Lookup)**: two inputs (ref + token), GET to `/api/tickets/lookup`. On success renders `TicketDetailCard` with subject, ref, opened date (date-fns format), StatusBadge, PriorityBadge, CategoryBadge, the ticket body in `<pre className="whitespace-pre-wrap font-sans">` (plain text — no dangerouslySetInnerHTML anywhere on the surface), and the message thread with per-role visual treatment: staff = amber accent, AI = emerald accent + "AI" badge, system = subtle dashed border + italic, customer = neutral. Wrong token / missing ref both render the same neutral "we couldn't find that ticket" error — no enumeration signal.
+  - **Tab 3 (Help me now)**: chat UI with messages list (`max-h-96 overflow-y-auto` + custom scrollbar via Tailwind arbitrary variants `[&::-webkit-scrollbar]:w-2 …`), composer textarea (Enter to send, Shift+Enter for newline), typing indicator (3 pulsing dots), and `aria-live="polite"` on the conversation container. User messages right-aligned with `bg-primary`, AI messages left-aligned with emerald accent. Disclaimer alert above the chat: "doesn't know your account or billing details; for anything sensitive, submit a ticket above." On AI null reply, in-thread fallback message: "I'm having trouble responding right now. Please submit a ticket above…" 429 shows a countdown; both error states animate in via framer-motion `<AnimatePresence>`.
+- Created `src/components/staff/staff-portal.tsx` as a minimal **stub** ONLY so `src/app/page.tsx` (which I can't modify) resolves its import and the dev server compiles. Documented in-file that task 2-b should overwrite this file in full — don't build on top of it.
+- Ran `bun run lint`. Initial pass flagged two of my own errors + one warning:
+  - `react-hooks/set-state-in-effect` in a `useCountdown` hook — refactored to a `<RetryCountdown>` component that initializes state via `useState(seconds)` and uses a `useRef` for the `onDone` callback so the interval effect can stay mount-only. No cascading render.
+  - Unused `eslint-disable` directive in `LookupTicketForm`'s auto-fetch effect — converted `doLookup` to `useCallback` with stable deps, listed it in the effect deps, removed the disable.
+  - After fixes, all my own files lint clean.
+- Verified end-to-end via curl against the running dev server on port 3000 (see `agent-ctx/2-a-customer-surface.md` for the full checklist). All endpoints return the expected status codes and shapes.
+
+Stage Summary:
+- Files created:
+  - `src/components/customer/types.ts`
+  - `src/components/customer/customer-portal.tsx` (~700 lines, 3 tabs, mobile-first responsive, accessible)
+  - `src/app/api/tickets/route.ts` (POST submit, rate-limited, validated, transactional)
+  - `src/app/api/tickets/lookup/route.ts` (GET lookup, constant-time token compare, no enumeration leak)
+  - `src/app/api/chat/route.ts` (POST chatbot, drops client system messages, graceful fallback)
+  - `src/components/staff/staff-portal.tsx` (STUB — task 2-b should overwrite)
+  - `agent-ctx/2-a-customer-surface.md` (work record for downstream agents)
+- Key decisions:
+  - Customer input rendered exclusively as plain text via React's default escaping + `<pre className="whitespace-pre-wrap">`. Zero uses of `dangerouslySetInnerHTML` on the surface.
+  - Same 404 response shape for "no such ref" and "wrong token" — closes the enumeration vector. Token compare is constant-time.
+  - Rate-limit (429) responses drive a live countdown UI via `Retry-After` header.
+  - Lookup token is shown ONCE on submit success; the in-memory hand-off to Tab 2 is the only path that pre-fills it. Never written to a URL fragment the browser would persist.
+  - Category / priority enum sets are duplicated server-side (API route) and client-side (zod schema) — server is the source of truth and falls back to defaults if the client lies.
+  - Color palette: zinc/neutral grays for chrome, emerald for primary success accents, amber for "awaiting reply" / high priority, red for urgent / destructive. No indigo, no blue.
+- Known limitations:
+  - `src/app/page.tsx:24` has a pre-existing `react-hooks/set-state-in-effect` lint error in `setSurface(readInitialSurface())`. The task instructions forbid modifying page.tsx, so it was left untouched. All my own files lint clean.
+  - The customer surface has no email verification, so "view all my tickets by email" was intentionally NOT built — that would let anyone who knows an email read that customer's tickets. Documented in the lookup route.
+  - Rate limiting is in-memory (per the foundation lib) — fine for a single-process sandbox, would need Redis at scale.
+  - The staff-portal file is a stub. Task 2-b must replace it with the real staff surface (login, queue, reply, AI draft suggestion).
+
+---
+Task ID: 2-b
+Agent: full-stack-developer (staff surface)
+Task: Build authed staff portal UI (login + queue + ticket detail + reply + AI draft) + 8 staff API routes
+
+Work Log:
+- Read worklog + all `src/lib/*.ts` + `prisma/schema.prisma` + `src/app/page.tsx` + the customer surface (types + portal + 3 routes) + shadcn primitives (`table`, `select`, `badge`, `skeleton`, `card`, `sonner`) + `agent-ctx/2-a-customer-surface.md` to confirm the contract before writing any staff code.
+- Created `src/components/staff/types.ts` with shared client/server types (`StaffUser`, `StaffListItem`, `StaffListResponse`, `QueueStats`, `StaffTicketDetail`, `StaffMessageView`, `PatchTicketRequest`, `ReplyRequest`, `DraftResult`, plus role/status/priority/category unions) so the UI stays in sync with the API contract.
+- Created `src/app/api/staff/login/route.ts` (POST):
+  - Rate-limited per IP via `RATE_LIMITS.staffLogin`, key `ip:login:${ip}`; cleanup after.
+  - Body parsed defensively; 400 on invalid JSON or missing email/password.
+  - Same 401 "Wrong email or password" whether the email is unknown OR the password is wrong — no enumeration signal.
+  - Unknown-user path still runs `verifyPassword` against a cached dummy hash so timing is roughly constant (no early return).
+  - On success: `signSessionToken(staff.id)` + `buildSessionCookieHeader(token)` in `Set-Cookie` + audit `auth.login` + 200 with `{id, email, name, role}`.
+  - Caught the module-level-`Response` trap from Task 2-a during curl testing (second 401 returned an empty body) — refactored `GENERIC_ERROR` constant into a `genericError()` factory that builds a fresh `Response` per call.
+- Created `src/app/api/staff/logout/route.ts` (POST): idempotent, clears cookie via `buildExpiredSessionCookieHeader()`, audit `auth.logout` only if there was a session. 200 + `{ok:true}` regardless.
+- Created `src/app/api/staff/me/route.ts` (GET): 401 if `getStaffFromRequest(req)` returns null, else 200 with `{id, email, name, role}`.
+- Created `src/app/api/staff/tickets/route.ts` (GET list):
+  - Gated by `getStaffFromRequest`; 401 if null.
+  - Filters: `status`, `priority`, `category` (each validated against fixed enum sets, unknown values silently ignored), `q` (subject/ref substring, capped at 200 chars, Prisma `contains` — no raw SQL), `assignee` (`me`/`unassigned`/`all`).
+  - Pagination: `page` (default 1) + `pageSize` (default 25, hard cap 100). Returns `{tickets, total, page, pageSize, stats}`.
+  - Default ordering: open+pending first, then createdAt desc. Implemented as a two-query window fetch (active bucket first, rest bucket fills remaining slots) — keeps the `include: {assignee, _count}` shape intact without raw SQL.
+  - Stats block is computed UNFILTERED (so the dashboard cards always reflect the true queue state, not the filtered view). `resolvedToday` counts tickets with `status='resolved' AND updatedAt >= start-of-day`.
+- Created `src/app/api/staff/tickets/[id]/route.ts` (GET + PATCH):
+  - Path param `id` is the Prisma cuid (NOT the public `ref`) — staff URLs use internal ids only, so the public `ref` never appears in staff URLs.
+  - GET returns ticket + messages (oldest first) + assignee + customer. Staff names on staff messages are resolved server-side via a single `StaffUser.findMany` lookup against the distinct `staffId`s in the thread — schema has `staffId` (plain String) but no Prisma relation to StaffUser, so we can't `include: { staff }`. Single extra query, no N+1.
+  - PATCH accepts any subset of `{status, priority, category, assigneeId}` with strict enum validation server-side. `assigneeId` must be an existing StaffUser id (foreign-key checked before write) or null. 422 on any invalid value, 404 if the ticket doesn't exist. Audit `ticket.update` with meta `{changes: [...]}` listing the changed fields (no body text).
+- Created `src/app/api/staff/tickets/[id]/reply/route.ts` (POST):
+  - Body `{body, aiDrafted}` — body validated via `validateMessageBody` (422 if empty), `aiDrafted` defaults to false if absent or wrong type (never trust the client flag).
+  - Transactional: in `db.$transaction`, creates the `TicketMessage` (authorRole: 'staff', staffId, aiDrafted) AND updates the ticket status to 'pending' (staff just replied → now waiting on customer). Either both write or neither.
+  - Audit `ticket.reply` with meta `{ticketId, aiDrafted, length}` — length only, never the body text.
+- Created `src/app/api/staff/tickets/[id]/draft/route.ts` (POST):
+  - Rate-limited per-staff via `RATE_LIMITS.aiDraft`, key `staff:${ctx.id}:draft`.
+  - Fetches the ticket + all messages; builds the `conversation` array for `draftStaffReply`: messages oldest-first, authorRole mapped (customer→'customer', staff→'staff', ai→'ai'), system messages dropped (internal bookkeeping, not conversation the AI should parrot).
+  - Calls `draftStaffReply` from `@/lib/ai`. On null → `{ok:true, data:{draft:null}}` so the UI shows a graceful fallback. AI is an enhancement, not a dependency.
+  - Audit `ticket.draft` with meta `{ok, length}` — length only, never the draft text.
+- Overwrote `src/components/staff/staff-portal.tsx` (the stub from Task 2-a) in full with the real staff surface:
+  - Root `StaffPortal` component manages three views (`login` | `queue` | `ticket`) plus `selectedTicketId`. On mount, calls `GET /api/staff/me` to restore an existing session; shows a bootstrapping skeleton while that fetch is in flight.
+  - **Login view**: card with email + password fields, "Sign in" button, "Demo accounts" hint box with one-click buttons that prefill the agent/admin credentials so a reviewer can sign in instantly. 401 → "Wrong email or password" (same for both failure modes). 429 → live `<RetryCountdown>` (component, not a hook — avoids the `set-state-in-effect` lint trap from Task 2-a).
+  - **Queue view**: top bar with greeting + role badge + "Refresh" + "Sign out" + "Updated Xs ago" indicator (ticks every second via `setInterval`). Stats row: 4 cards (Open / Awaiting reply / Resolved today / Unassigned) with role-coloured accents (emerald/amber/zinc/red). Filter bar: status / priority / category / assignee Selects + a debounced search box (300ms). Desktop: shadcn `Table` with mono ref, truncated subject, customer email/name, status/priority/category badges, relative time, assignee. Mobile: stacked cards (`hidden md:table` + `md:hidden` cards). Empty state for no matches. Polls `/api/staff/tickets` every 15s while visible (with proper `setInterval` cleanup on unmount) — this is the staff agent's live queue.
+  - **Ticket detail view**: header with ref + badges (status/priority/category, all editable via `Select`), customer email with a "Copy" button (uses `navigator.clipboard.writeText`), original ticket body in a `<pre className="whitespace-pre-wrap font-sans">` (plain text — never `dangerouslySetInnerHTML`). Message thread with per-role visual treatment: staff = amber accent + staff name + "AI-assisted" badge when aiDrafted, AI = emerald accent + "AI" badge, customer = neutral, system = muted italic dashed border. Reply box: `Textarea` with character counter (mirrors `LIMITS.MAX_BODY` from `@/lib/sanitize`) + "Suggest a reply ✨" button (calls the draft endpoint, populates the textarea but does NOT send; shows an "AI-suggested" badge while loaded) + "Send reply" button (calls reply endpoint with `aiDrafted` flag; optimistic append to thread + background refetch). Status/priority/category/assignee changes hit PATCH with optimistic update; on failure the previous state is restored and a toast shows the error. Loading skeleton for the initial fetch. 401 → "session expired" toast + return to login.
+  - All buttons show spinners during async ops. All errors surface via `sonner` toasts — no `alert()` anywhere. Sticky footer is the shell's responsibility (page.tsx) — the staff portal doesn't render its own.
+- Ran `bun run lint`. Only the pre-existing `page.tsx:24` error remains (forbidden to fix per task instructions). All my own files lint clean.
+- Verified end-to-end via curl against the running dev server on port 3000 (see `agent-ctx/2-b-staff-surface.md` for the full checklist). All 8 endpoints return the expected status codes and shapes. Confirmed: same 401 body for unknown user vs wrong password across 3 consecutive calls (the module-level-Response trap is avoided), PATCH with invalid enum returns 422, PATCH with unknown assignee returns 422 (foreign-key checked), PATCH on nonexistent ticket returns 404, POST /reply flips status to pending in the same transaction, POST /draft returns a real AI-generated draft in ~2s.
+
+Stage Summary:
+- Files created:
+  - `src/components/staff/types.ts`
+  - `src/components/staff/staff-portal.tsx` (~1100 lines, login + queue + ticket detail + reply + AI draft, mobile-first responsive, accessible, optimistic updates)
+  - `src/app/api/staff/login/route.ts` (POST, rate-limited, signed session cookie, constant-time error)
+  - `src/app/api/staff/logout/route.ts` (POST, idempotent, clears cookie)
+  - `src/app/api/staff/me/route.ts` (GET, 401 if no session)
+  - `src/app/api/staff/tickets/route.ts` (GET list with filters, pagination, unfiltered stats block)
+  - `src/app/api/staff/tickets/[id]/route.ts` (GET detail + PATCH subset)
+  - `src/app/api/staff/tickets/[id]/reply/route.ts` (POST transactional reply + status flip)
+  - `src/app/api/staff/tickets/[id]/draft/route.ts` (POST AI draft, rate-limited)
+  - `agent-ctx/2-b-staff-surface.md` (work record for downstream agents)
+- Key decisions:
+  - Staff URLs use the Prisma `id` (cuid), not the public `ref` — keeps staff URLs off the customer-facing identifier, consistent API surface.
+  - Same 401 response for unknown email vs wrong password; dummy-hash compare on the unknown path keeps timing roughly constant.
+  - Two-query window fetch for "open+pending first" ordering — keeps `include: {assignee, _count}` shape intact without raw SQL.
+  - Staff names on messages resolved server-side via a single `StaffUser.findMany` lookup (schema has `staffId` but no Prisma relation — can't `include: { staff }` without modifying schema, which is forbidden).
+  - Audit logs store lengths and field-change strings only — never customer/staff PII body text.
+  - `genericError()` factory instead of a module-level `Response` constant — avoids the "empty body on second call" trap that the customer lookup route originally fell into.
+  - Optimistic UI for PATCH (status/priority/category/assignee) — instant feedback, reverts on failure with a toast.
+  - Rate-limit (429) responses drive a live countdown UI via `<RetryCountdown>`.
+  - Color palette: zinc/neutral chrome, emerald for open/resolved, amber for pending/high, red for urgent/destructive. No indigo, no blue.
+- Known limitations:
+  - `src/app/page.tsx:24` pre-existing lint error untouched (forbidden to fix). All my own files lint clean.
+  - Session revocation is stateless — logout clears the cookie client-side, but the signed HMAC token remains technically valid for up to its 12h TTL. The documented tradeoff from `src/lib/auth.ts`; a server-side session table or a token-version counter on StaffUser would be the proper fix at scale.
+  - The queue polls every 15s (no WebSocket push) — kept consistent with Task 2-a's "polling only" decision for the time box.
+  - Search is `contains` (substring) — SQLite doesn't have full-text search wired up in this build. Fine for the demo volumes.
+  - The optimistic PATCH revert isn't atomic across rapid sequential updates — last response wins, UI eventually reconciles. Edge case, not blocking.
+
+---
+Task ID: 3 (integration) + 4 (docs) + 5 (README)
+Agent: main (orchestrator)
+Task: Integration pass, final self-verification with agent-browser, and write the 5 documentation deliverables (README, SCOPE, DECISIONS, AI_USAGE, HANDOVER)
+
+Work Log:
+- Read both subagents' worklog entries (Task 2-a, Task 2-b) to confirm the full state of the system.
+- Fixed the pre-existing `page.tsx:24` lint error (react-hooks/set-state-in-effect) that both subagents were forbidden to touch. Refactored to a `sync()` callback inside the effect instead of a direct `setState` call. `bun run lint` now passes with 0 errors / 0 warnings.
+- Started the dev server in the background (the sandbox pattern: `(nohup bun run dev </dev/null >dev.log 2>&1 &)` was needed to keep the process alive after the Bash tool call returned — `nohup ... & disown` did not survive).
+- Verified end-to-end via curl:
+  - Customer ticket submit → 201 with `{ref, lookupToken}`
+  - Customer ticket lookup (valid token) → 200 with full ticket + messages
+  - Customer ticket lookup (wrong token) → 404 with the SAME error message as missing ref (no enumeration signal)
+  - Customer AI chat → 200 with a real LLM reply
+  - Staff login (valid) → 200 with session cookie
+  - Staff login (wrong password + unknown user) → 401 with the SAME generic error
+  - Staff tickets list → 200 with 5 tickets + stats block
+  - Staff ticket detail → 200 with full message thread
+  - Staff AI draft → 200 with a thoughtful 2-sentence reply
+  - Staff reply POST → 201 with the new message; ticket status auto-flipped to "pending"
+  - Cross-surface: customer lookup of the just-replied ticket shows the staff reply in the customer's thread
+- Verified end-to-end via agent-browser (full 11-step walkthrough):
+  1. Customer surface renders with 3 tabs (Submit / Status / Help me now)
+  2. Staff login form renders with one-click demo account buttons
+  3. Demo agent login succeeds → queue renders with 5 tickets, stats, filters, search, polling indicator
+  4. Ticket detail renders with editable badges, message thread, reply box, AI draft button
+  5. AI draft suggestion populates the reply box, toast confirms
+  6. Customer chat: user message + AI reply both render in the chat list
+  7. Customer submit: form accepts input, success screen shows ref + lookup token + save-token warning
+  8. "View my ticket" auto-prefills the lookup form and runs the lookup → ticket detail renders
+  9. Staff reply: filled reply box, sent, reply immediately appears in staff thread with "agent · you" badge
+  10. Customer cross-check via curl: staff reply now visible in customer's ticket view
+  11. No console errors, no hydration mismatches, sticky footer verified on all views
+- Wrote the 5 documentation deliverables:
+  - README.md (8.5KB) — local setup, demo accounts, architecture overview
+  - SCOPE.md (12.6KB) — 3 real security risks for THIS system (stored XSS, ticket enumeration, AI prompt-injection), what I did about each, + 1 honest-known-limitation (no staff read audit). Time-box accounting. What I deliberately didn't build.
+  - DECISIONS.md (12.9KB) — 14 decisions with reason/alternative/trade-off, including 2 marked as "I'd revisit" (15s polling, missing Prisma relation on TicketMessage.staffId) + 1 process lesson (stub shared files before dispatching subagents)
+  - AI_USAGE.md (14.0KB) — tools used (Z.ai Code orchestrator, 2 full-stack-developer subagents, z-ai-web-dev-sdk for AI features, agent-browser for verification), time saved, the module-level-Response trap both subagents hit, one rejected recommendation (frontend-styling-expert subagent), how I verified, what was my own thinking
+  - HANDOVER.md (17.6KB) — written for a non-technical founder: what was delivered in plain language, the customer + staff workflows, 14 known limitations stated plainly (the scored section), the next 5 things to build ranked, and where the architecture breaks at 100 users / 10,000 users / 1M tickets
+- Verified `dangerouslySetInnerHTML` is used ZERO times on either customer or staff surface (grep confirms — only appearance is in the shadcn `chart.tsx` primitive, which is vendored library code, and in our own comments saying we don't use it).
+
+Stage Summary:
+- The system is fully working end-to-end. Both surfaces render, the customer → staff → customer reply loop is real and verified.
+- Lint passes cleanly (0 errors, 0 warnings).
+- All 5 documentation deliverables are written and present in the project root.
+- Total source code: 75 files, ~8,400 lines (a large fraction is the shadcn/ui primitive library — our own code is ~3,000 lines across two surfaces, 11 API routes, 6 lib files, and the page shell).
+- Time spent: roughly 5 hours of orchestrator time + 2 hours of parallel subagent wall-clock. Under the 6-hour budget.
+- The single most-felt limitation in actual use is the 15-second queue polling — flagged as the first thing to revisit in DECISIONS.md item 13 and the second thing to build in HANDOVER.md.
+- Final state: shippable. The reviewer can open the Preview Panel, toggle to Staff, click the "Agent" demo-account button, click Sign in, and immediately see a working staff console. They can submit a ticket from the customer side and watch it appear in the staff queue (within 15s). They can chat with the AI assistant and get a real reply. They can generate an AI draft on a ticket and edit it before sending. The full golden path is real.
+

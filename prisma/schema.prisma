@@ -1,0 +1,101 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A customer who submits tickets. Not a registered account — created on first
+// ticket submission, keyed by email. We never store a password for customers.
+model Customer {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tickets Ticket[]
+}
+
+model Ticket {
+  id            String   @id @default(cuid())
+  // Public-facing reference shown to customer (e.g. "HD-ABC123"). Used in UI.
+  ref           String   @unique
+  // Unguessable token required to view a ticket's status + messages by
+  // unauthenticated customer. Signed (HMAC) at the API layer as a second
+  // factor, so a DB read alone is not enough.
+  lookupToken   String   @unique
+  subject       String
+  body          String
+  status        String   @default("open") // open | pending | resolved | closed
+  priority      String   @default("normal") // low | normal | high | urgent
+  // Categories used for queue filtering and routing suggestions.
+  category      String   @default("general") // general | billing | bug | account | feature
+  customerEmail String
+  customerName  String?
+  // Set when a staff member picks the ticket up.
+  assigneeId    String?
+  assignee      StaffUser? @relation(fields: [assigneeId], references: [id])
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  customer  Customer?     @relation(fields: [customerEmail], references: [email])
+  messages  TicketMessage[]
+
+  @@index([status])
+  @@index([customerEmail])
+  @@index([createdAt])
+}
+
+model TicketMessage {
+  id          String   @id @default(cuid())
+  ticketId    String
+  ticket      Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  // customer | staff | ai | system — system is for status-change notes
+  authorRole  String
+  // For staff messages: the staff user's id. Null otherwise.
+  staffId     String?
+  body        String
+  // If this message was an AI-suggested draft that the staff member accepted,
+  // we record that fact for audit/quality review.
+  aiDrafted   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([ticketId])
+  @@index([createdAt])
+}
+
+model StaffUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  // scrypt-hashed. Never plaintext, never bcrypt (avoid native build deps).
+  passwordHash String
+  role         String   @default("agent") // agent | admin
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tickets  Ticket[]
+  auditLogs AuditLog[]
+}
+
+// Append-only audit log for staff actions. Required for a support tool that
+// handles customer data — we need to know who did what, when.
+model AuditLog {
+  id        String   @id @default(cuid())
+  staffId   String
+  staff     StaffUser @relation(fields: [staffId], references: [id])
+  action    String   // ticket.open | ticket.reply | ticket.status_change | ticket.assign | auth.login | auth.logout
+  targetId  String?  // ticket id, if applicable
+  meta      String?  // JSON string of additional context
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([staffId])
+  @@index([createdAt])
+}
