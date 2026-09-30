@@ -144,6 +144,66 @@ Each entry: **Decision / Reason / Alternative considered / Trade-off accepted**.
 
 ---
 
+## Second-pass decisions (closing gaps against the full brief)
+
+After the first pass, I re-read the full brief and caught gaps. These are the decisions made in the second pass:
+
+### 15. Customers CAN reply to their own tickets (POST /api/tickets/[ref]/reply)
+
+**Reason.** The brief says "whether they can reply is your decision. Defend it." The original build had customers submit + view but not reply — a real product gap. Customers need to add information ("oh wait, I'm on macOS 14.2"), push back on a staff suggestion, or confirm a fix worked. Those are replies on the existing ticket, not new tickets. I added a POST endpoint that takes `{token, body}`, validates the token (constant-time, same 404 as lookup), creates a `TicketMessage` with `authorRole: 'customer'`, and flips the ticket status back to `open` (so it pops to the top of the staff queue). The UI shows the reply box only when the ticket is `open` or `pending` — closed/resolved tickets return 409.
+
+**Alternative considered.** A separate "follow-up" flow where each reply creates a new ticket linked to the old one via a `parentTicketId`. Tempting for "ticket splitting" but heavier — the simple thread model is enough for 60 customers.
+
+**Trade-off accepted.** Closed tickets can't be re-opened by customer reply (staff must reopen if appropriate). Prevents the zombie-ticket pattern where customers keep replying to months-old closed tickets.
+
+### 16. Tests: unit tests for pure functions + one full-workflow integration test, NOT a UI test suite
+
+**Reason.** The brief explicitly says "Tests where they earn their place, including at least one covering a full user workflow. Tell us what you chose not to test and why." I shipped 67 tests:
+- Unit tests for `computeStaleness` (the staleness pure function — 19 cases, all 4 rules + priority order + edge cases), `validateTicketInput` + `validateMessageBody`, and `hashPassword`/`verifyPassword`/`signSessionToken`/`verifySessionToken`.
+- One 9-step full-workflow integration test (`tests/workflow.test.ts`) that exercises the customer→staff→customer reply loop end-to-end through the real API handlers (no HTTP server — it imports the `POST`/`GET` exports directly and calls them with mock `Request` objects).
+
+The workflow test uses a separate test database (`db/test.db`) so it never touches the demo DB the reviewer sees.
+
+**Alternative considered.** A React component test suite (Testing Library + Vitest). Rejected — the cost of maintaining component tests at this scale exceeds the value; agent-browser end-to-end verification covers the visual + interaction layer more reliably and is documented in the worklog. See [tests/README.md](./tests/README.md) for the full "what we chose not to test and why" list.
+
+**Trade-off accepted.** A UI change that breaks rendering won't fail the test suite — only an API contract change or a pure-function logic change will. That's a deliberate scope: tests earn their place by catching regressions in logic, not in styling.
+
+### 17. Staleness model — four concrete rules, surfaced as a pure function
+
+**Reason.** The brief says "Nothing silently falls through the cracks. Whatever 'falling through the cracks' means in your model of the problem." That phrasing requires me to *have a model*. Mine: four rules, in priority order:
+1. Unassigned open ticket > 1h — no one's picked it up.
+2. Open ticket with no staff reply > 4h — no agent has acknowledged it.
+3. Open ticket with no activity > 24h — may need a nudge.
+4. Pending ticket (awaiting customer reply) inactive > 72h — customer may have given up.
+
+Implemented as `computeStaleness({...})` in `src/lib/sla.ts` — pure function, no DB, takes a `now` parameter for deterministic testing. The staff queue endpoint computes staleness per-ticket on the visible page + an unfiltered stats block. The UI shows a `StaleBadge` per ticket, a `Stale tickets` stat card, and a "Show only stale" filter toggle.
+
+**Alternative considered.** A more sophisticated SLA model with per-customer SLA tiers (large customers get faster SLAs than small ones). Tempting given the brief mentions "the people who matter most aren't answered first," but I deliberately didn't tie SLAs to customer plan size in v1 — that's a real product decision (which customers get which SLA?) that needs founder input, not an afternoon's default. The current model treats all customers equally; the priority field captures urgency manually.
+
+**Trade-off accepted.** The thresholds are starting values, configurable in one place (`src/lib/sla.ts`). The 4h/24h/72h numbers are guesses until we have a week of real data. The dashboard surfaces them honestly — if "median first reply today" is 8 minutes, no one's stale by the 4h rule. The numbers tell you whether the thresholds need tightening or loosening.
+
+### 18. The "are we slow?" question is answered with two specific stats — median first reply + stale count
+
+**Reason.** The brief says "The founder can answer 'are we slow?' honestly — including to a large customer who claims they are." Two stats answer that:
+- **Median first reply (today)**: across all tickets first-replied today, the median time from ticket creation to first staff reply. Shown as "12m 30s" on the dashboard.
+- **Stale ticket count**: how many tickets are currently breaching one of the four staleness rules.
+
+A founder answering a large customer's complaint can say: "Your ticket was first replied to in 8 minutes; our median today is 12 minutes; we have zero stale tickets right now." That's data, not defensiveness.
+
+**Alternative considered.** A full SLA-tracking system with percentile charts, per-customer response-time breakdowns, and a trends graph over time. Out of scope for v1 — the right move once we have a month of data, not before. The two stats are enough to answer the question honestly on day one.
+
+**Trade-off accepted.** The stats are point-in-time, not historical. You can't ask "how slow were we last week?" — only "how slow are we right now?" Historical trends are a v2.
+
+### 19. AI scope: bounded customer chatbot + never-auto-send staff draft (rather than an ambitious auto-responder)
+
+**Reason.** The brief says: "If the strongest case is that AI adds little here, make that case — with a small, well-chosen capability and a clear argument for why the ambitious version was wrong." My argument: the ambitious version (auto-draft-and-send replies without a human) is wrong because (a) the model can confidently invent pricing/policy that doesn't exist, (b) wiring it to live customer data raises prompt-injection stakes enormously, (c) the cost of a human click is small, the cost of an unreviewed AI reply is unbounded. The bounded version (chatbot says "I don't know your account"; staff draft always requires a Send click) is the defensible scope.
+
+**Alternative considered.** An "AI confidence threshold" — if the model is >95% confident in a draft, auto-send; else show for review. Rejected — the model can be confidently wrong, and the failure mode (a bad auto-reply to a customer) is exactly the case that matters most. A click is cheap; an apology is not.
+
+**Trade-off accepted.** Every reply requires a click, even for trivial high-confidence drafts. The staff UX is slightly slower than a hypothetical "auto-send" mode. That's the right cost.
+
+---
+
 ## Non-decisions (things that were not real choices)
 
 For honesty — these were forced by the project spec or by the time box, not real decisions:

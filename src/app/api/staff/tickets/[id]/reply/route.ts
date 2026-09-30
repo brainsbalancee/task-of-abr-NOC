@@ -112,7 +112,7 @@ export async function POST(
         staffName: auth.name,
         staffRole: auth.role as 'agent' | 'admin',
       },
-    })
+    }, 201)
   } catch (e) {
     console.error('[api/staff/tickets/[id]/reply] failed:', e)
     return json(

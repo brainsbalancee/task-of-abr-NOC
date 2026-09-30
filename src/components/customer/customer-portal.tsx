@@ -77,6 +77,7 @@ import type {
   FieldErrors,
   SubmitResult,
   TicketDetail,
+  TicketMessageView,
 } from './types'
 
 // ============================================================
@@ -621,9 +622,14 @@ type LookupFormValues = z.infer<typeof lookupSchema>
 type LookupTabProps = {
   prefillRef?: string
   prefillToken?: string
+  onSwitchToSubmit?: () => void
 }
 
-function LookupTicketForm({ prefillRef = '', prefillToken = '' }: LookupTabProps) {
+function LookupTicketForm({
+  prefillRef = '',
+  prefillToken = '',
+  onSwitchToSubmit,
+}: LookupTabProps) {
   const {
     register,
     handleSubmit,
@@ -637,11 +643,17 @@ function LookupTicketForm({ prefillRef = '', prefillToken = '' }: LookupTabProps
   const [notFound, setNotFound] = useState(false)
   const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
   const [ticket, setTicket] = useState<TicketDetail | null>(null)
+  // The lookup API deliberately omits `lookupToken` from its response (we
+  // never echo it back). The customer-reply composer needs the token the
+  // customer typed, so we capture it here at lookup time and thread it down.
+  // Stays stable across re-renders until a new lookup replaces it.
+  const [lookupTokenForReply, setLookupTokenForReply] = useState('')
 
   const doLookup = useCallback(async (values: LookupFormValues) => {
     setLoading(true)
     setNotFound(false)
     setTicket(null)
+    setLookupTokenForReply('')
     try {
       const params = new URLSearchParams({
         ref: values.ref.trim().toUpperCase(),
@@ -653,6 +665,9 @@ function LookupTicketForm({ prefillRef = '', prefillToken = '' }: LookupTabProps
       const payload: unknown = await res.json().catch(() => null)
       if (res.ok && payload && typeof payload === 'object' && 'data' in payload) {
         setTicket((payload as { data: TicketDetail }).data)
+        // Capture the token the customer just typed — needed for the
+        // reply composer. Trim to match the API's own normalisation.
+        setLookupTokenForReply(values.token.trim())
         return
       }
       if (res.status === 429) {
@@ -773,12 +788,45 @@ function LookupTicketForm({ prefillRef = '', prefillToken = '' }: LookupTabProps
         </CardContent>
       </Card>
 
-      {ticket && <TicketDetailCard ticket={ticket} />}
+      {ticket && (
+        <TicketDetailCard
+          ticket={ticket}
+          lookupToken={lookupTokenForReply}
+          onReplySent={(msg) =>
+            setTicket((cur) =>
+              cur
+                ? {
+                    ...cur,
+                    // Customer reply reopens the ticket (server does the same).
+                    status: 'open',
+                    messages: [...cur.messages, msg],
+                  }
+                : cur,
+            )
+          }
+          onSwitchToSubmit={onSwitchToSubmit}
+        />
+      )}
     </div>
   )
 }
 
-function TicketDetailCard({ ticket }: { ticket: TicketDetail }) {
+// We need the raw token the customer typed (the API deliberately omits
+// lookupToken from the response — never expose it back). Watch the field
+// via `register` and grab its value when needed for the reply call.
+type TicketDetailCardProps = {
+  ticket: TicketDetail
+  lookupToken: string
+  onReplySent: (msg: TicketMessageView) => void
+  onSwitchToSubmit?: () => void
+}
+
+function TicketDetailCard({
+  ticket,
+  lookupToken,
+  onReplySent,
+  onSwitchToSubmit,
+}: TicketDetailCardProps) {
   const created = new Date(ticket.createdAt)
   return (
     <motion.div
@@ -820,7 +868,14 @@ function TicketDetailCard({ ticket }: { ticket: TicketDetail }) {
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Conversation ({ticket.messages.length})
             </h3>
-            <ol className="grid gap-3">
+            {/* aria-live so screen readers announce new messages as they
+                are appended (e.g. the customer's optimistic reply, or a
+                staff reply picked up on a future refetch). */}
+            <ol
+              className="grid gap-3"
+              aria-live="polite"
+              aria-label="Conversation messages"
+            >
               {ticket.messages.map((m) => (
                 <li key={m.id}>
                   <MessageRow
@@ -833,9 +888,281 @@ function TicketDetailCard({ ticket }: { ticket: TicketDetail }) {
               ))}
             </ol>
           </section>
+
+          {/* Reply box — only on tickets staff are still actively working.
+              `resolved` and `closed` are both read-only from the customer
+              side; the server enforces the same on POST (409). */}
+          {ticket.status === 'open' || ticket.status === 'pending' ? (
+            <ReplyComposer
+              ref_={ticket.ref}
+              lookupToken={lookupToken}
+              onSent={onReplySent}
+            />
+          ) : (
+            <ClosedTicketNote
+              status={
+                ticket.status === 'resolved' ? 'resolved' : 'closed'
+              }
+              onSwitchToSubmit={onSwitchToSubmit}
+            />
+          )}
         </CardContent>
       </Card>
     </motion.div>
+  )
+}
+
+/**
+ * Read-only ticket notice. Shown in place of the reply box when the
+ * ticket is no longer accepting customer follow-ups (`closed` or
+ * `resolved`). Offers a one-tap jump back to the Submit tab so the
+ * customer can file a fresh ticket without losing context. Wording
+ * varies slightly by status.
+ */
+function ClosedTicketNote({
+  status = 'closed',
+  onSwitchToSubmit,
+}: {
+  status?: 'closed' | 'resolved'
+  onSwitchToSubmit?: () => void
+}) {
+  const isResolved = status === 'resolved'
+  return (
+    <Alert>
+      <TicketIcon className="h-4 w-4 text-muted-foreground" />
+      <AlertTitle>
+        {isResolved ? 'This ticket is resolved' : 'This ticket is closed'}
+      </AlertTitle>
+      <AlertDescription className="flex flex-col gap-2">
+        {isResolved ? (
+          <span>
+            We&apos;ve marked this ticket as resolved. If you still need
+            help, please submit a new ticket above.
+          </span>
+        ) : (
+          <span>
+            If you still need help, please submit a new ticket above — we
+            won&apos;t reopen closed tickets automatically.
+          </span>
+        )}
+        {onSwitchToSubmit && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="w-fit"
+            onClick={onSwitchToSubmit}
+          >
+            <MessageSquarePlus className="h-4 w-4" />
+            Submit a new ticket
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+/**
+ * Customer reply composer — a follow-up from the customer on their own
+ * ticket. This is the customer-side mirror of the staff reply box, but
+ * visually distinct (neutral zinc accent, smaller, with a "your reply is
+ * visible to staff + anyone with the token" helper line) so it's clear
+ * this is the customer's own follow-up, not a staff reply.
+ *
+ * Contract with the API (POST /api/tickets/[ref]/reply, body `{token, body}`):
+ *  - 201 `{ok:true, data:{messageId}}` → build the message view
+ *    client-side (the API returns only the id) and optimistic-append it
+ *    to the thread via `onSent`, clear the textarea, success toast.
+ *  - 404 (missing ref OR wrong token) → neutral toast: "We couldn't find
+ *    that ticket. Try re-entering your reference and token." — do NOT
+ *    distinguish (enumeration closure, same as the lookup endpoint).
+ *  - 409 (ticket is closed/resolved) → toast with the server's message +
+ *    hide the composer (re-render as the read-only note).
+ *  - 422 (body validation) → inline error above the textarea.
+ *  - 429 (rate limited) → RetryCountdown (same component the rest of the
+ *    surface uses).
+ *  - 5xx / network → toast "Something went wrong. Please try again."
+ *    Keep the typed text so the user can retry without retyping.
+ */
+function ReplyComposer({
+  ref_,
+  lookupToken,
+  onSent,
+}: {
+  ref_: string
+  lookupToken: string
+  onSent: (msg: TicketMessageView) => void
+}) {
+  const [body, setBody] = useState('')
+  const [sending, setSending] = useState(false)
+  const [fieldError, setFieldError] = useState<string | null>(null)
+  const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
+  const [closed, setClosed] = useState(false)
+
+  const onSend = async () => {
+    const trimmed = body.trim()
+    if (!trimmed || sending || rateLimitReset !== null) return
+    setSending(true)
+    setFieldError(null)
+    try {
+      const res = await fetch(
+        `/api/tickets/${encodeURIComponent(ref_)}/reply`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: lookupToken, body: trimmed }),
+        },
+      )
+      const payload: unknown = await res.json().catch(() => null)
+
+      if (
+        res.status === 201 &&
+        payload &&
+        typeof payload === 'object' &&
+        'data' in payload
+      ) {
+        const data = (payload as { data: { messageId: string } }).data
+        // Optimistic append — the API returns only the id, so we build
+        // the view client-side with the trimmed body the customer just
+        // sent and the server's id (a subsequent lookup de-dupes by id).
+        onSent({
+          id: data.messageId,
+          authorRole: 'customer',
+          body: trimmed,
+          createdAt: new Date().toISOString(),
+          aiDrafted: false,
+        })
+        setBody('')
+        toast.success("Reply sent — we'll get back to you.")
+        return
+      }
+      if (
+        res.status === 422 &&
+        payload &&
+        typeof payload === 'object' &&
+        'error' in payload
+      ) {
+        const err = (payload as { error: unknown }).error
+        setFieldError(
+          typeof err === 'string' && err ? err : 'Please write a bit more.',
+        )
+        return
+      }
+      if (res.status === 409) {
+        // Server says the ticket is now closed/resolved (race with a
+        // staff close/resolve). Toast the server's message and hide the
+        // composer so the read-only note renders in its place.
+        toast.error(
+          'This ticket is closed. Please open a new ticket if you need more help.',
+        )
+        setClosed(true)
+        return
+      }
+      if (res.status === 429) {
+        const retryAfter = Number(res.headers.get('Retry-After') ?? '60')
+        setRateLimitReset(Math.max(1, retryAfter))
+        return
+      }
+      if (res.status === 404) {
+        // Missing ref OR wrong token — same neutral message as the lookup
+        // endpoint. Do NOT distinguish (enumeration closure).
+        toast.error(
+          "We couldn't find that ticket. Try re-entering your reference and token.",
+        )
+        return
+      }
+      // 5xx / unknown
+      toast.error('Something went wrong. Please try again.')
+    } catch {
+      toast.error('Something went wrong. Please try again.')
+    } finally {
+      setSending(false)
+    }
+  }
+
+  if (closed) {
+    return <ClosedTicketNote />
+  }
+
+  const disabled = sending || rateLimitReset !== null
+  const empty = body.trim().length === 0
+
+  return (
+    <section
+      className="grid gap-3 rounded-lg border border-border/60 bg-muted/20 p-4"
+      aria-label="Add a reply"
+    >
+      <div className="grid gap-1">
+        <Label
+          htmlFor="reply-body"
+          className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+        >
+          Add a reply
+        </Label>
+        <p className="text-[11px] leading-relaxed text-muted-foreground">
+          Your reply will be visible to support staff working this ticket,
+          and to anyone with this ticket&apos;s reference and lookup token.
+        </p>
+      </div>
+
+      {fieldError && (
+        <p role="alert" className="text-xs text-destructive">
+          {fieldError}
+        </p>
+      )}
+
+      <Textarea
+        id="reply-body"
+        value={body}
+        onChange={(e) => {
+          setBody(e.target.value)
+          if (fieldError) setFieldError(null)
+        }}
+        rows={4}
+        maxLength={LIMITS.MAX_BODY}
+        placeholder="Type your reply…"
+        disabled={disabled}
+        aria-invalid={!!fieldError}
+        className="resize-y"
+      />
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <span className="text-[11px] text-muted-foreground tabular-nums">
+          {body.length}/{LIMITS.MAX_BODY}
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          onClick={onSend}
+          disabled={disabled || empty}
+          className="sm:w-auto"
+        >
+          {sending ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" /> Sending…
+            </>
+          ) : (
+            <>
+              <Send className="h-4 w-4" /> Send reply
+            </>
+          )}
+        </Button>
+      </div>
+
+      {rateLimitReset !== null && (
+        <Alert>
+          <TriangleAlert className="h-4 w-4 text-amber-600" />
+          <AlertDescription>
+            You&apos;ve sent a few replies in a row. Please wait{' '}
+            <RetryCountdown
+              seconds={rateLimitReset}
+              onDone={() => setRateLimitReset(null)}
+            />{' '}
+            before sending another.
+          </AlertDescription>
+        </Alert>
+      )}
+    </section>
   )
 }
 
@@ -1214,6 +1541,7 @@ export function CustomerPortal() {
             key={lookupNonce}
             prefillRef={prefill?.ref}
             prefillToken={prefill?.token}
+            onSwitchToSubmit={() => setTab('submit')}
           />
         </TabsContent>
 

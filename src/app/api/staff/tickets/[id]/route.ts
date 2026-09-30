@@ -82,6 +82,28 @@ async function fetchTicketShape(id: string) {
       : []
   const staffById = new Map(staffRecords.map((s) => [s.id, s]))
 
+  // ---- Customer history context ---------------------------------------
+  // Other tickets by the same customer (excluding this one), newest first,
+  // limited to 5. Lets the answering staff see at a glance if this is a
+  // recurring issue or a high-touch customer — without leaving the screen.
+  const customerHistory = await db.ticket.findMany({
+    where: {
+      customerEmail: ticket.customerEmail,
+      id: { not: ticket.id },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 5,
+    select: {
+      id: true,
+      ref: true,
+      subject: true,
+      status: true,
+      priority: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  })
+
   return {
     id: ticket.id,
     ref: ticket.ref,
@@ -114,6 +136,15 @@ async function fetchTicketShape(id: string) {
         staffRole: (staff?.role as 'agent' | 'admin' | null) ?? null,
       }
     }),
+    customerHistory: customerHistory.map((h) => ({
+      id: h.id,
+      ref: h.ref,
+      subject: h.subject,
+      status: h.status,
+      priority: h.priority,
+      createdAt: h.createdAt.toISOString(),
+      updatedAt: h.updatedAt.toISOString(),
+    })),
   }
 }
 

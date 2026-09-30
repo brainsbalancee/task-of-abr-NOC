@@ -29,6 +29,13 @@ export type QueueStats = {
   pending: number
   resolvedToday: number
   unassigned: number
+  /** Median (first staff reply createdAt - ticket createdAt) for tickets
+   * whose first staff reply landed today (UTC). 0 if no replies today. */
+  medianFirstResponseMsToday: number
+  /** Age in ms of the oldest unassigned open ticket. 0 if none unassigned. */
+  oldestUnassignedAgeMs: number
+  /** Count of stale tickets across the whole queue (open+pending). */
+  staleCount: number
 }
 
 /** Row in the ticket queue list. No message bodies — just metadata. */
@@ -45,6 +52,11 @@ export type StaffListItem = {
   createdAt: string // ISO 8601
   updatedAt: string // ISO 8601
   _count: { messages: number }
+  /** True if this ticket matches a "falling through the cracks" rule.
+   * See `computeStaleness` in `src/lib/sla.ts`. */
+  stale: boolean
+  /** Human-readable reason for staleness, or null if not stale. */
+  staleReason: string | null
 }
 
 export type StaffListResponse = {
@@ -82,6 +94,28 @@ export type StaffTicketDetail = {
   createdAt: string
   updatedAt: string
   messages: StaffMessageView[]
+  /** Other tickets by the same customer (excluding this one), newest first. */
+  customerHistory: CustomerHistoryEntry[]
+}
+
+/** A summary of another ticket by the same customer, shown in the detail
+ * sidebar so staff have context without leaving the screen. */
+export type CustomerHistoryEntry = {
+  id: string
+  ref: string
+  subject: string
+  status: TicketStatus
+  priority: TicketPriority
+  createdAt: string // ISO 8601
+  updatedAt: string // ISO 8601
+}
+
+/** Public-safe staff user list (id/name/role only) returned by
+ * GET /api/staff/users for the assign-to-colleague dropdown. */
+export type StaffUserSummary = {
+  id: string
+  name: string
+  role: StaffRole
 }
 
 /** Reply/draft action request payloads. */

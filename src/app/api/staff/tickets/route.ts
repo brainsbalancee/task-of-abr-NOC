@@ -2,10 +2,11 @@
  * GET /api/staff/tickets
  *
  * The staff queue. Returns paginated ticket metadata + a stats block
- * (open / pending / resolved-today / unassigned) for the dashboard
- * cards. Message bodies are NOT returned here — they're fetched per
- * ticket on detail view. This keeps the queue payload small even when
- * there are hundreds of tickets.
+ * (open / pending / resolved-today / unassigned / median-first-reply-today
+ * / oldest-unassigned-age / stale-count) for the dashboard cards. Message
+ * bodies are NOT returned here — they're fetched per ticket on detail view.
+ * This keeps the queue payload small even when there are hundreds of
+ * tickets.
  *
  * Hardening:
  *  - Gated by `getStaffFromRequest` — 401 if not authed.
@@ -15,12 +16,15 @@
  *  - `pageSize` is capped at 100.
  *  - Default ordering: open + pending first (case statement), then
  *    createdAt desc. Newest action on top.
+ *  - Staleness is computed via the shared `computeStaleness` helper in
+ *    `src/lib/sla.ts` so the queue and (future) detail view share logic.
  */
 
 import { NextRequest } from 'next/server'
 
 import { db } from '@/lib/db'
 import { json, getStaffFromRequest } from '@/lib/api'
+import { computeStaleness } from '@/lib/sla'
 
 const STATUSES = ['open', 'pending', 'resolved', 'closed'] as const
 const PRIORITIES = ['low', 'normal', 'high', 'urgent'] as const
@@ -161,11 +165,49 @@ export async function GET(req: NextRequest) {
 
   const tickets = [...activeItems, ...restItems]
 
+  // ---- Per-ticket first staff reply time (for staleness + median) ----
+  // One groupBy query across ALL tickets — we use this for both the
+  // visible page (to compute staleness on each row) AND the unfiltered
+  // stats block (median first reply today + stale count). groupBy is
+  // cheap: it scans the TicketMessage index on (ticketId, createdAt).
+  const firstReplyRows = await db.ticketMessage.groupBy({
+    by: ['ticketId'],
+    where: { authorRole: 'staff' },
+    _min: { createdAt: true },
+  })
+  const firstReplyByTicket: Map<string, Date | null> = new Map()
+  for (const r of firstReplyRows) {
+    firstReplyByTicket.set(
+      r.ticketId,
+      r._min.createdAt ? new Date(r._min.createdAt) : null,
+    )
+  }
+
+  // Helper for staleness — single source of truth, shared with the stats.
+  const stalenessOf = (t: {
+    status: string
+    assigneeId: string | null
+    id: string
+    createdAt: Date
+    updatedAt: Date
+  }) =>
+    computeStaleness({
+      status: t.status,
+      assigneeId: t.assigneeId,
+      lastStaffReplyAt: firstReplyByTicket.get(t.id) ?? null,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+    })
+
   // ---- Stats ----------------------------------------------------------
   // Compute stats based on the UNFILTERED queue (so the dashboard cards
   // always reflect the true queue state, not the filtered view).
   const startOfToday = new Date()
   startOfToday.setHours(0, 0, 0, 0)
+  // UTC midnight — used for the "median first reply today" stat per the
+  // brief's spec ("today (UTC)").
+  const startOfTodayUTC = new Date()
+  startOfTodayUTC.setUTCHours(0, 0, 0, 0)
 
   const [openCount, pendingCount, unassignedCount, resolvedTodayCount] =
     await Promise.all([
@@ -180,32 +222,103 @@ export async function GET(req: NextRequest) {
       }),
     ])
 
+  // ---- Median first reply (today, UTC) -------------------------------
+  // For every ticket that had its first staff reply today, compute
+  // (firstReply - ticket.createdAt) in ms and take the median.
+  const todayPairs: { id: string; firstReplyAt: Date }[] = []
+  for (const [id, t] of firstReplyByTicket.entries()) {
+    if (t && t.getTime() >= startOfTodayUTC.getTime()) {
+      todayPairs.push({ id, firstReplyAt: t })
+    }
+  }
+
+  let medianFirstResponseMsToday = 0
+  if (todayPairs.length > 0) {
+    const ticketsToday = await db.ticket.findMany({
+      where: { id: { in: todayPairs.map((p) => p.id) } },
+      select: { id: true, createdAt: true },
+    })
+    const createdAtById = new Map(ticketsToday.map((t) => [t.id, t.createdAt]))
+    const deltas = todayPairs
+      .map(({ id, firstReplyAt }) => {
+        const created = createdAtById.get(id)
+        if (!created) return null
+        return firstReplyAt.getTime() - created.getTime()
+      })
+      .filter((d): d is number => d !== null && d >= 0)
+      .sort((a, b) => a - b)
+    if (deltas.length > 0) {
+      const mid = Math.floor(deltas.length / 2)
+      medianFirstResponseMsToday =
+        deltas.length % 2 === 0
+          ? Math.round((deltas[mid - 1] + deltas[mid]) / 2)
+          : deltas[mid]
+    }
+  }
+
+  // ---- Oldest unassigned open ticket age -----------------------------
+  const oldestUnassigned = await db.ticket.findFirst({
+    where: { assigneeId: null, status: 'open' },
+    orderBy: { createdAt: 'asc' },
+    select: { createdAt: true },
+  })
+  const oldestUnassignedAgeMs = oldestUnassigned
+    ? Math.max(0, Date.now() - oldestUnassigned.createdAt.getTime())
+    : 0
+
+  // ---- Stale count (over the whole queue) ----------------------------
+  // Fetch all open+pending tickets (resolved/closed are never stale per
+  // computeStaleness). For the demo volumes this is fine; at scale we'd
+  // push the computation into SQL.
+  const staleCandidates = await db.ticket.findMany({
+    where: { status: { in: ['open', 'pending'] } },
+    select: {
+      id: true,
+      status: true,
+      assigneeId: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+  })
+  let staleCount = 0
+  for (const t of staleCandidates) {
+    if (stalenessOf(t).stale) staleCount += 1
+  }
+
   const stats = {
     open: openCount,
     pending: pendingCount,
     resolvedToday: resolvedTodayCount,
     unassigned: unassignedCount,
+    medianFirstResponseMsToday,
+    oldestUnassignedAgeMs,
+    staleCount,
   }
 
   return json({
     ok: true,
     data: {
-      tickets: tickets.map((t) => ({
-        id: t.id,
-        ref: t.ref,
-        subject: t.subject,
-        status: t.status,
-        priority: t.priority,
-        category: t.category,
-        customerEmail: t.customerEmail,
-        customerName: t.customerName,
-        assignee: t.assignee
-          ? { id: t.assignee.id, name: t.assignee.name }
-          : null,
-        createdAt: t.createdAt.toISOString(),
-        updatedAt: t.updatedAt.toISOString(),
-        _count: { messages: t._count.messages },
-      })),
+      tickets: tickets.map((t) => {
+        const s = stalenessOf(t)
+        return {
+          id: t.id,
+          ref: t.ref,
+          subject: t.subject,
+          status: t.status,
+          priority: t.priority,
+          category: t.category,
+          customerEmail: t.customerEmail,
+          customerName: t.customerName,
+          assignee: t.assignee
+            ? { id: t.assignee.id, name: t.assignee.name }
+            : null,
+          createdAt: t.createdAt.toISOString(),
+          updatedAt: t.updatedAt.toISOString(),
+          _count: { messages: t._count.messages },
+          stale: s.stale,
+          staleReason: s.reason,
+        }
+      }),
       total,
       page,
       pageSize,

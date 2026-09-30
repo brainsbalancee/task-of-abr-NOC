@@ -1,0 +1,1473 @@
+     1→'use client'
+     2→
+     3→/**
+     4→ * CustomerPortal — the public, unauthenticated customer surface.
+     5→ *
+     6→ * Three tabs:
+     7→ *   1. Submit a ticket   → POST /api/tickets
+     8→ *   2. Check ticket status → GET /api/tickets/lookup?ref=…&token=…
+     9→ *   3. Help me now        → POST /api/chat (AI chatbot)
+    10→ *
+    11→ * Security notes (mirrored on the API side):
+    12→ *  - All customer input is rendered as plain text. React's default escaping
+    13→ *    is our XSS defense — we never reach for dangerouslySetInnerHTML.
+    14→ *  - The `lookupToken` returned by the submit endpoint is the customer's
+    15→ *    only handle on their ticket. We display it once on submit and pre-fill
+    16→ *    the lookup form via in-memory state when they click "View my ticket".
+    17→ *    We never put it in a URL fragment the browser would persist or log.
+    18→ *  - Rate-limit (429) responses render a friendly countdown.
+    19→ */
+    20→
+    21→import { useCallback, useEffect, useRef, useState } from 'react'
+    22→import { useForm } from 'react-hook-form'
+    23→import { zodResolver } from '@hookform/resolvers/zod'
+    24→import { z } from 'zod'
+    25→import { motion, AnimatePresence } from 'framer-motion'
+    26→import { format } from 'date-fns'
+    27→import { toast } from 'sonner'
+    28→import {
+    29→  AlertCircle,
+    30→  ArrowRight,
+    31→  Bot,
+    32→  CheckCircle2,
+    33→  ClipboardCopy,
+    34→  LifeBuoy,
+    35→  Loader2,
+    36→  MessageSquarePlus,
+    37→  Search,
+    38→  Send,
+    39→  Sparkles,
+    40→  Ticket as TicketIcon,
+    41→  TriangleAlert,
+    42→  User,
+    43→} from 'lucide-react'
+    44→
+    45→import {
+    46→  Tabs,
+    47→  TabsList,
+    48→  TabsTrigger,
+    49→  TabsContent,
+    50→} from '@/components/ui/tabs'
+    51→import {
+    52→  Card,
+    53→  CardContent,
+    54→  CardDescription,
+    55→  CardHeader,
+    56→  CardTitle,
+    57→} from '@/components/ui/card'
+    58→import { Input } from '@/components/ui/input'
+    59→import { Textarea } from '@/components/ui/textarea'
+    60→import { Label } from '@/components/ui/label'
+    61→import { Button } from '@/components/ui/button'
+    62→import { Badge } from '@/components/ui/badge'
+    63→import {
+    64→  Select,
+    65→  SelectContent,
+    66→  SelectItem,
+    67→  SelectTrigger,
+    68→  SelectValue,
+    69→} from '@/components/ui/select'
+    70→import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+    71→
+    72→import { LIMITS } from '@/lib/sanitize'
+    73→import { cn } from '@/lib/utils'
+    74→import type {
+    75→  ChatMessage,
+    76→  ChatResult,
+    77→  FieldErrors,
+    78→  SubmitResult,
+    79→  TicketDetail,
+    80→  TicketMessageView,
+    81→} from './types'
+    82→
+    83→// ============================================================
+    84→// Shared display helpers
+    85→// ============================================================
+    86→
+    87→const STATUS_LABELS: Record<string, string> = {
+    88→  open: 'Open',
+    89→  pending: 'Awaiting reply',
+    90→  resolved: 'Resolved',
+    91→  closed: 'Closed',
+    92→}
+    93→
+    94→const PRIORITY_LABELS: Record<string, string> = {
+    95→  low: 'Low',
+    96→  normal: 'Normal',
+    97→  high: 'High',
+    98→  urgent: 'Urgent',
+    99→}
+   100→
+   101→const CATEGORY_LABELS: Record<string, string> = {
+   102→  general: 'General',
+   103→  billing: 'Billing',
+   104→  bug: 'Bug report',
+   105→  account: 'Account',
+   106→  feature: 'Feature request',
+   107→}
+   108→
+   109→function StatusBadge({ status }: { status: string }) {
+   110→  const cls: Record<string, string> = {
+   111→    open: 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-400',
+   112→    pending: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400',
+   113→    resolved: 'border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400',
+   114→    closed: 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-500',
+   115→  }
+   116→  return (
+   117→    <Badge variant="outline" className={cls[status] ?? cls.open}>
+   118→      {STATUS_LABELS[status] ?? status}
+   119→    </Badge>
+   120→  )
+   121→}
+   122→
+   123→function PriorityBadge({ priority }: { priority: string }) {
+   124→  const cls: Record<string, string> = {
+   125→    low: 'border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400',
+   126→    normal: 'border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300',
+   127→    high: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400',
+   128→    urgent: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400',
+   129→  }
+   130→  return (
+   131→    <Badge variant="outline" className={cls[priority] ?? cls.normal}>
+   132→      {PRIORITY_LABELS[priority] ?? priority}
+   133→    </Badge>
+   134→  )
+   135→}
+   136→
+   137→function CategoryBadge({ category }: { category: string }) {
+   138→  return (
+   139→    <Badge variant="outline" className="border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
+   140→      {CATEGORY_LABELS[category] ?? category}
+   141→    </Badge>
+   142→  )
+   143→}
+   144→
+   145→/**
+   146→ * Rate-limit retry countdown.
+   147→ *
+   148→ * Implemented as a component (not a hook) so the state initializer runs on
+   149→ * mount — no synchronous setState-in-effect, which keeps the linter happy
+   150→ * and avoids a cascading render. The parent conditionally renders this
+   151→ * (only when `rateLimitReset` is set), so each 429 mounts a fresh countdown
+   152→ * with the right starting value.
+   153→ */
+   154→function RetryCountdown({
+   155→  seconds,
+   156→  onDone,
+   157→}: {
+   158→  seconds: number
+   159→  onDone: () => void
+   160→}) {
+   161→  const [remaining, setRemaining] = useState(seconds)
+   162→  // Hold onDone in a ref so the interval effect can stay mount-only.
+   163→  const onDoneRef = useRef(onDone)
+   164→  useEffect(() => {
+   165→    onDoneRef.current = onDone
+   166→  }, [onDone])
+   167→
+   168→  useEffect(() => {
+   169→    if (seconds <= 0) {
+   170→      onDoneRef.current()
+   171→      return
+   172→    }
+   173→    const id = setInterval(() => {
+   174→      setRemaining((r) => {
+   175→        if (r <= 1) {
+   176→          clearInterval(id)
+   177→          onDoneRef.current()
+   178→          return 0
+   179→        }
+   180→        return r - 1
+   181→      })
+   182→    }, 1000)
+   183→    return () => clearInterval(id)
+   184→  }, [seconds])
+   185→
+   186→  return (
+   187→    <span className="font-semibold tabular-nums" aria-live="polite">
+   188→      {remaining}s
+   189→    </span>
+   190→  )
+   191→}
+   192→
+   193→// ============================================================
+   194→// Tab 1 — Submit a ticket
+   195→// ============================================================
+   196→
+   197→const ticketSchema = z.object({
+   198→  subject: z
+   199→    .string()
+   200→    .min(3, 'Subject must be at least 3 characters.')
+   201→    .max(LIMITS.MAX_SUBJECT, `Subject must be under ${LIMITS.MAX_SUBJECT} characters.`),
+   202→  body: z
+   203→    .string()
+   204→    .min(10, 'Please give us a bit more detail (at least 10 characters).')
+   205→    .max(LIMITS.MAX_BODY, `Description must be under ${LIMITS.MAX_BODY} characters.`),
+   206→  customerEmail: z
+   207→    .string()
+   208→    .min(1, 'Email is required.')
+   209→    .email('That email address does not look right.'),
+   210→  customerName: z
+   211→    .string()
+   212→    .max(LIMITS.MAX_NAME, `Name must be under ${LIMITS.MAX_NAME} characters.`)
+   213→    .optional(),
+   214→})
+   215→
+   216→type TicketFormValues = z.infer<typeof ticketSchema>
+   217→
+   218→type SubmitTabProps = {
+   219→  onSubmitted: (result: SubmitResult) => void
+   220→}
+   221→
+   222→function SubmitTicketForm({ onSubmitted }: SubmitTabProps) {
+   223→  const {
+   224→    register,
+   225→    handleSubmit,
+   226→    watch,
+   227→    reset,
+   228→    formState: { errors },
+   229→  } = useForm<TicketFormValues>({
+   230→    resolver: zodResolver(ticketSchema),
+   231→    defaultValues: {
+   232→      subject: '',
+   233→      body: '',
+   234→      customerEmail: '',
+   235→      customerName: '',
+   236→    },
+   237→  })
+   238→
+   239→  const [category, setCategory] = useState<string>('general')
+   240→  const [priority, setPriority] = useState<string>('normal')
+   241→  const [submitting, setSubmitting] = useState(false)
+   242→  const [serverError, setServerError] = useState<string | null>(null)
+   243→  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
+   244→  const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
+   245→  const [success, setSuccess] = useState<SubmitResult | null>(null)
+   246→
+   247→  // Clear inline server field errors the moment the user edits that field.
+   248→  const clearFieldError = (field: string) => {
+   249→    if (fieldErrors[field]) {
+   250→      setFieldErrors((prev) => {
+   251→        const next = { ...prev }
+   252→        delete next[field]
+   253→        return next
+   254→      })
+   255→    }
+   256→  }
+   257→
+   258→  const subjectLen = watch('subject')?.length ?? 0
+   259→  const bodyLen = watch('body')?.length ?? 0
+   260→
+   261→  const onSubmit = async (values: TicketFormValues) => {
+   262→    setServerError(null)
+   263→    setFieldErrors({})
+   264→    setSubmitting(true)
+   265→    try {
+   266→      const res = await fetch('/api/tickets', {
+   267→        method: 'POST',
+   268→        headers: { 'Content-Type': 'application/json' },
+   269→        body: JSON.stringify({
+   270→          ...values,
+   271→          category,
+   272→          priority,
+   273→        }),
+   274→      })
+   275→      const payload: unknown = await res.json().catch(() => null)
+   276→      if (res.ok && payload && typeof payload === 'object' && 'data' in payload) {
+   277→        const data = (payload as { data: SubmitResult }).data
+   278→        setSuccess(data)
+   279→        reset()
+   280→        setCategory('general')
+   281→        setPriority('normal')
+   282→        toast.success('Ticket submitted')
+   283→        return
+   284→      }
+   285→      // 422 with field errors
+   286→      if (res.status === 422 && payload && typeof payload === 'object' && 'fields' in payload) {
+   287→        const fields = (payload as { fields: FieldErrors }).fields ?? {}
+   288→        setFieldErrors(fields)
+   289→        return
+   290→      }
+   291→      if (res.status === 429) {
+   292→        const retryAfter = Number(res.headers.get('Retry-After') ?? '60')
+   293→        setRateLimitReset(Math.max(1, retryAfter))
+   294→        return
+   295→      }
+   296→      const msg =
+   297→        payload && typeof payload === 'object' && 'error' in payload
+   298→          ? String((payload as { error: unknown }).error)
+   299→          : "We couldn't submit your ticket. Please try again."
+   300→      setServerError(msg)
+   301→    } catch {
+   302→      setServerError('Network error. Please check your connection and try again.')
+   303→    } finally {
+   304→      setSubmitting(false)
+   305→    }
+   306→  }
+   307→
+   308→  // ---- Success view -------------------------------------------------
+   309→  if (success) {
+   310→    return (
+   311→      <SubmitSuccessCard
+   312→        result={success}
+   313→        onReset={() => setSuccess(null)}
+   314→        onView={() => {
+   315→          setSuccess(null)
+   316→          onSubmitted(success)
+   317→        }}
+   318→      />
+   319→    )
+   320→  }
+   321→
+   322→  // ---- Form view ----------------------------------------------------
+   323→  const disabled = submitting || rateLimitReset !== null
+   324→
+   325→  return (
+   326→    <Card className="border-border/60 shadow-sm">
+   327→      <CardHeader>
+   328→        <CardTitle className="flex items-center gap-2 text-lg">
+   329→          <MessageSquarePlus className="h-5 w-5 text-emerald-600" />
+   330→          Submit a ticket
+   331→        </CardTitle>
+   332→        <CardDescription>
+   333→          Tell us what's going on. An agent will reply as soon as possible.
+   334→        </CardDescription>
+   335→      </CardHeader>
+   336→      <CardContent>
+   337→        <form
+   338→          onSubmit={handleSubmit(onSubmit)}
+   339→          className="grid gap-5"
+   340→          noValidate
+   341→        >
+   342→          {/* Subject */}
+   343→          <div className="grid gap-2">
+   344→            <div className="flex items-baseline justify-between">
+   345→              <Label htmlFor="subject">Subject *</Label>
+   346→              <span className="text-[11px] text-muted-foreground tabular-nums">
+   347→                {subjectLen}/{LIMITS.MAX_SUBJECT}
+   348→              </span>
+   349→            </div>
+   350→            <Input
+   351→              id="subject"
+   352→              autoComplete="off"
+   353→              maxLength={LIMITS.MAX_SUBJECT}
+   354→              aria-invalid={!!errors.subject || !!fieldErrors.subject}
+   355→              disabled={disabled}
+   356→              {...register('subject', {
+   357→                onChange: () => clearFieldError('subject'),
+   358→              })}
+   359→              placeholder="A short summary of your issue"
+   360→            />
+   361→            <FieldError msg={errors.subject?.message ?? fieldErrors.subject ?? null} />
+   362→          </div>
+   363→
+   364→          {/* Body */}
+   365→          <div className="grid gap-2">
+   366→            <div className="flex items-baseline justify-between">
+   367→              <Label htmlFor="body">Details *</Label>
+   368→              <span className="text-[11px] text-muted-foreground tabular-nums">
+   369→                {bodyLen}/{LIMITS.MAX_BODY}
+   370→              </span>
+   371→            </div>
+   372→            <Textarea
+   373→              id="body"
+   374→              rows={6}
+   375→              maxLength={LIMITS.MAX_BODY}
+   376→              aria-invalid={!!errors.body || !!fieldErrors.body}
+   377→              disabled={disabled}
+   378→              {...register('body', {
+   379→                onChange: () => clearFieldError('body'),
+   380→              })}
+   381→              placeholder="What were you trying to do? What happened instead? Any error messages you can paste here help."
+   382→            />
+   383→            <FieldError msg={errors.body?.message ?? fieldErrors.body ?? null} />
+   384→          </div>
+   385→
+   386→          {/* Category + Priority */}
+   387→          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+   388→            <div className="grid gap-2">
+   389→              <Label htmlFor="category">Category</Label>
+   390→              <Select
+   391→                value={category}
+   392→                onValueChange={setCategory}
+   393→                disabled={disabled}
+   394→              >
+   395→                <SelectTrigger id="category" className="w-full">
+   396→                  <SelectValue placeholder="Pick a category" />
+   397→                </SelectTrigger>
+   398→                <SelectContent>
+   399→                  <SelectItem value="general">General</SelectItem>
+   400→                  <SelectItem value="billing">Billing</SelectItem>
+   401→                  <SelectItem value="bug">Bug report</SelectItem>
+   402→                  <SelectItem value="account">Account</SelectItem>
+   403→                  <SelectItem value="feature">Feature request</SelectItem>
+   404→                </SelectContent>
+   405→              </Select>
+   406→            </div>
+   407→            <div className="grid gap-2">
+   408→              <Label htmlFor="priority">Priority</Label>
+   409→              <Select
+   410→                value={priority}
+   411→                onValueChange={setPriority}
+   412→                disabled={disabled}
+   413→              >
+   414→                <SelectTrigger id="priority" className="w-full">
+   415→                  <SelectValue placeholder="Pick a priority" />
+   416→                </SelectTrigger>
+   417→                <SelectContent>
+   418→                  <SelectItem value="low">Low — minor inconvenience</SelectItem>
+   419→                  <SelectItem value="normal">Normal — should work</SelectItem>
+   420→                  <SelectItem value="high">High — blocking work</SelectItem>
+   421→                  <SelectItem value="urgent">Urgent — outage / data loss</SelectItem>
+   422→                </SelectContent>
+   423→              </Select>
+   424→            </div>
+   425→          </div>
+   426→
+   427→          {/* Email + Name */}
+   428→          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+   429→            <div className="grid gap-2">
+   430→              <Label htmlFor="customerEmail">Email *</Label>
+   431→              <Input
+   432→                id="customerEmail"
+   433→                type="email"
+   434→                autoComplete="email"
+   435→                aria-invalid={!!errors.customerEmail || !!fieldErrors.customerEmail}
+   436→                disabled={disabled}
+   437→                {...register('customerEmail', {
+   438→                  onChange: () => clearFieldError('customerEmail'),
+   439→                })}
+   440→                placeholder="you@example.com"
+   441→              />
+   442→              <FieldError msg={errors.customerEmail?.message ?? fieldErrors.customerEmail ?? null} />
+   443→            </div>
+   444→            <div className="grid gap-2">
+   445→              <Label htmlFor="customerName">Name (optional)</Label>
+   446→              <Input
+   447→                id="customerName"
+   448→                autoComplete="name"
+   449→                disabled={disabled}
+   450→                {...register('customerName')}
+   451→                placeholder="What should we call you?"
+   452→              />
+   453→              <FieldError msg={errors.customerName?.message ?? null} />
+   454→            </div>
+   455→          </div>
+   456→
+   457→          {/* Footer / actions */}
+   458→          {serverError && (
+   459→            <Alert variant="destructive">
+   460→              <AlertCircle className="h-4 w-4" />
+   461→              <AlertTitle>Couldn&apos;t submit</AlertTitle>
+   462→              <AlertDescription>{serverError}</AlertDescription>
+   463→            </Alert>
+   464→          )}
+   465→          {rateLimitReset !== null && (
+   466→            <Alert>
+   467→              <TriangleAlert className="h-4 w-4 text-amber-600" />
+   468→              <AlertTitle>Slow down a moment</AlertTitle>
+   469→              <AlertDescription>
+   470→                You&apos;ve submitted a few tickets in a row. Please wait{' '}
+   471→                <RetryCountdown
+   472→                  seconds={rateLimitReset}
+   473→                  onDone={() => setRateLimitReset(null)}
+   474→                />{' '}
+   475→                before submitting another.
+   476→              </AlertDescription>
+   477→            </Alert>
+   478→          )}
+   479→          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+   480→            <Button type="submit" disabled={disabled} className="sm:w-auto">
+   481→              {submitting ? (
+   482→                <>
+   483→                  <Loader2 className="h-4 w-4 animate-spin" />
+   484→                  Submitting…
+   485→                </>
+   486→              ) : (
+   487→                <>
+   488→                  Submit ticket
+   489→                  <ArrowRight className="h-4 w-4" />
+   490→                </>
+   491→              )}
+   492→            </Button>
+   493→          </div>
+   494→          <p className="text-[11px] text-muted-foreground">
+   495→            By submitting, you agree we may keep a record of this conversation to
+   496→            help you and improve our service. We don&apos;t share your details.
+   497→          </p>
+   498→        </form>
+   499→      </CardContent>
+   500→    </Card>
+   501→  )
+   502→}
+   503→
+   504→function FieldError({ msg }: { msg: string | null | undefined }) {
+   505→  if (!msg) return null
+   506→  return (
+   507→    <p role="alert" className="text-xs text-destructive">
+   508→      {msg}
+   509→    </p>
+   510→  )
+   511→}
+   512→
+   513→function SubmitSuccessCard({
+   514→  result,
+   515→  onReset,
+   516→  onView,
+   517→}: {
+   518→  result: SubmitResult
+   519→  onReset: () => void
+   520→  onView: () => void
+   521→}) {
+   522→  const [copied, setCopied] = useState<'ref' | 'token' | null>(null)
+   523→  const copy = async (which: 'ref' | 'token', value: string) => {
+   524→    try {
+   525→      await navigator.clipboard.writeText(value)
+   526→      setCopied(which)
+   527→      toast.success(which === 'ref' ? 'Reference copied' : 'Token copied')
+   528→      setTimeout(() => setCopied(null), 1500)
+   529→    } catch {
+   530→      toast.error('Could not copy — please copy manually')
+   531→    }
+   532→  }
+   533→
+   534→  return (
+   535→    <Card className="border-emerald-200 bg-emerald-50/40 dark:border-emerald-900 dark:bg-emerald-950/20">
+   536→      <CardHeader>
+   537→        <CardTitle className="flex items-center gap-2 text-lg">
+   538→          <CheckCircle2 className="h-5 w-5 text-emerald-600" />
+   539→          Ticket submitted
+   540→        </CardTitle>
+   541→        <CardDescription>
+   542→          We&apos;ve logged your ticket. Save the details below so you can come
+   543→          back to it.
+   544→        </CardDescription>
+   545→      </CardHeader>
+   546→      <CardContent className="grid gap-5">
+   547→        <div className="grid gap-2">
+   548→          <Label className="text-xs text-muted-foreground">Ticket reference</Label>
+   549→          <div className="flex items-center gap-2">
+   550→            <code className="rounded-md border border-emerald-200 bg-background px-3 py-2 font-mono text-lg font-semibold tracking-wide dark:border-emerald-900">
+   551→              {result.ref}
+   552→            </code>
+   553→            <Button
+   554→              type="button"
+   555→              variant="outline"
+   556→              size="icon"
+   557→              onClick={() => copy('ref', result.ref)}
+   558→              aria-label="Copy ticket reference"
+   559→            >
+   560→              <ClipboardCopy className="h-4 w-4" />
+   561→            </Button>
+   562→            {copied === 'ref' && (
+   563→              <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+   564→            )}
+   565→          </div>
+   566→        </div>
+   567→
+   568→        <div className="grid gap-2">
+   569→          <Label className="text-xs text-muted-foreground">Your lookup token</Label>
+   570→          <div className="flex items-start gap-2">
+   571→            <code className="block w-full break-all rounded-md border border-emerald-200 bg-background px-3 py-2 font-mono text-xs dark:border-emerald-900">
+   572→              {result.lookupToken}
+   573→            </code>
+   574→            <Button
+   575→              type="button"
+   576→              variant="outline"
+   577→              size="icon"
+   578→              onClick={() => copy('token', result.lookupToken)}
+   579→              aria-label="Copy lookup token"
+   580→              className="shrink-0"
+   581→            >
+   582→              <ClipboardCopy className="h-4 w-4" />
+   583→            </Button>
+   584→          </div>
+   585→        </div>
+   586→
+   587→        <Alert>
+   588→          <TriangleAlert className="h-4 w-4 text-amber-600" />
+   589→          <AlertTitle>Save this token</AlertTitle>
+   590→          <AlertDescription>
+   591→            You&apos;ll need it (along with the reference) to check your ticket
+   592→            status. We don&apos;t email it in this build, and we can&apos;t
+   593→            recover it if you lose it.
+   594→          </AlertDescription>
+   595→        </Alert>
+   596→
+   597→        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+   598→          <Button type="button" variant="ghost" onClick={onReset}>
+   599→            Submit another
+   600→          </Button>
+   601→          <Button type="button" onClick={onView}>
+   602→            View my ticket
+   603→            <ArrowRight className="h-4 w-4" />
+   604→          </Button>
+   605→        </div>
+   606→      </CardContent>
+   607→    </Card>
+   608→  )
+   609→}
+   610→
+   611→// ============================================================
+   612→// Tab 2 — Check ticket status
+   613→// ============================================================
+   614→
+   615→const lookupSchema = z.object({
+   616→  ref: z.string().min(1, 'Enter your ticket reference.'),
+   617→  token: z.string().min(1, 'Enter your lookup token.'),
+   618→})
+   619→
+   620→type LookupFormValues = z.infer<typeof lookupSchema>
+   621→
+   622→type LookupTabProps = {
+   623→  prefillRef?: string
+   624→  prefillToken?: string
+   625→  onSwitchToSubmit?: () => void
+   626→}
+   627→
+   628→function LookupTicketForm({
+   629→  prefillRef = '',
+   630→  prefillToken = '',
+   631→  onSwitchToSubmit,
+   632→}: LookupTabProps) {
+   633→  const {
+   634→    register,
+   635→    handleSubmit,
+   636→    formState: { errors },
+   637→  } = useForm<LookupFormValues>({
+   638→    resolver: zodResolver(lookupSchema),
+   639→    defaultValues: { ref: prefillRef, token: prefillToken },
+   640→  })
+   641→
+   642→  const [loading, setLoading] = useState(false)
+   643→  const [notFound, setNotFound] = useState(false)
+   644→  const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
+   645→  const [ticket, setTicket] = useState<TicketDetail | null>(null)
+   646→  // The lookup API deliberately omits `lookupToken` from its response (we
+   647→  // never echo it back). The customer-reply composer needs the token the
+   648→  // customer typed, so we capture it here at lookup time and thread it down.
+   649→  // Stays stable across re-renders until a new lookup replaces it.
+   650→  const [lookupTokenForReply, setLookupTokenForReply] = useState('')
+   651→
+   652→  const doLookup = useCallback(async (values: LookupFormValues) => {
+   653→    setLoading(true)
+   654→    setNotFound(false)
+   655→    setTicket(null)
+   656→    setLookupTokenForReply('')
+   657→    try {
+   658→      const params = new URLSearchParams({
+   659→        ref: values.ref.trim().toUpperCase(),
+   660→        token: values.token.trim(),
+   661→      })
+   662→      const res = await fetch(`/api/tickets/lookup?${params.toString()}`, {
+   663→        method: 'GET',
+   664→      })
+   665→      const payload: unknown = await res.json().catch(() => null)
+   666→      if (res.ok && payload && typeof payload === 'object' && 'data' in payload) {
+   667→        setTicket((payload as { data: TicketDetail }).data)
+   668→        // Capture the token the customer just typed — needed for the
+   669→        // reply composer. Trim to match the API's own normalisation.
+   670→        setLookupTokenForReply(values.token.trim())
+   671→        return
+   672→      }
+   673→      if (res.status === 429) {
+   674→        const retryAfter = Number(res.headers.get('Retry-After') ?? '60')
+   675→        setRateLimitReset(Math.max(1, retryAfter))
+   676→        return
+   677→      }
+   678→      // 404 (no such ref OR wrong token) → same neutral message.
+   679→      setNotFound(true)
+   680→    } catch {
+   681→      setNotFound(true)
+   682→    } finally {
+   683→      setLoading(false)
+   684→    }
+   685→  }, [])
+   686→
+   687→  // Auto-fetch when both prefill values are present (i.e. user just clicked
+   688→  // "View my ticket" on the submit tab). `didAutoFetch` guards against a
+   689→  // double-fire under React 18+ StrictMode in dev.
+   690→  const didAutoFetch = useRef(false)
+   691→  useEffect(() => {
+   692→    if (didAutoFetch.current) return
+   693→    if (prefillRef && prefillToken) {
+   694→      didAutoFetch.current = true
+   695→      void doLookup({ ref: prefillRef, token: prefillToken })
+   696→    }
+   697→  }, [prefillRef, prefillToken, doLookup])
+   698→
+   699→  const disabled = loading || rateLimitReset !== null
+   700→
+   701→  return (
+   702→    <div className="grid gap-4">
+   703→      <Card className="border-border/60 shadow-sm">
+   704→        <CardHeader>
+   705→          <CardTitle className="flex items-center gap-2 text-lg">
+   706→            <Search className="h-5 w-5 text-emerald-600" />
+   707→            Check ticket status
+   708→          </CardTitle>
+   709→          <CardDescription>
+   710→            Enter the reference and lookup token you got when you submitted
+   711→            your ticket.
+   712→          </CardDescription>
+   713→        </CardHeader>
+   714→        <CardContent>
+   715→          <form
+   716→            onSubmit={handleSubmit(doLookup)}
+   717→            className="grid gap-4"
+   718→            noValidate
+   719→          >
+   720→            <div className="grid gap-2">
+   721→              <Label htmlFor="ref">Ticket reference</Label>
+   722→              <Input
+   723→                id="ref"
+   724→                autoCapitalize="characters"
+   725→                autoComplete="off"
+   726→                disabled={disabled}
+   727→                aria-invalid={!!errors.ref}
+   728→                {...register('ref')}
+   729→                placeholder="HD-AB12CD"
+   730→              />
+   731→              <FieldError msg={errors.ref?.message ?? null} />
+   732→            </div>
+   733→            <div className="grid gap-2">
+   734→              <Label htmlFor="token">Lookup token</Label>
+   735→              <Input
+   736→                id="token"
+   737→                autoComplete="off"
+   738→                disabled={disabled}
+   739→                aria-invalid={!!errors.token}
+   740→                {...register('token')}
+   741→                placeholder="Paste the long token you were given"
+   742→                className="font-mono text-xs"
+   743→              />
+   744→              <FieldError msg={errors.token?.message ?? null} />
+   745→            </div>
+   746→
+   747→            {notFound && (
+   748→              <Alert>
+   749→                <AlertCircle className="h-4 w-4" />
+   750→                <AlertTitle>We couldn&apos;t find that ticket</AlertTitle>
+   751→                <AlertDescription>
+   752→                  Check your reference and token and try again. The token is
+   753→                  case-sensitive — copy it exactly as it was shown to you.
+   754→                </AlertDescription>
+   755→              </Alert>
+   756→            )}
+   757→            {rateLimitReset !== null && (
+   758→              <Alert>
+   759→                <TriangleAlert className="h-4 w-4 text-amber-600" />
+   760→                <AlertTitle>Slow down a moment</AlertTitle>
+   761→                <AlertDescription>
+   762→                  Please wait{' '}
+   763→                  <RetryCountdown
+   764→                    seconds={rateLimitReset}
+   765→                    onDone={() => setRateLimitReset(null)}
+   766→                  />{' '}
+   767→                  before trying again.
+   768→                </AlertDescription>
+   769→              </Alert>
+   770→            )}
+   771→
+   772→            <div className="flex justify-end">
+   773→              <Button type="submit" disabled={disabled}>
+   774→                {loading ? (
+   775→                  <>
+   776→                    <Loader2 className="h-4 w-4 animate-spin" />
+   777→                    Looking up…
+   778→                  </>
+   779→                ) : (
+   780→                  <>
+   781→                    <Search className="h-4 w-4" />
+   782→                    Look up ticket
+   783→                  </>
+   784→                )}
+   785→              </Button>
+   786→            </div>
+   787→          </form>
+   788→        </CardContent>
+   789→      </Card>
+   790→
+   791→      {ticket && (
+   792→        <TicketDetailCard
+   793→          ticket={ticket}
+   794→          lookupToken={lookupTokenForReply}
+   795→          onReplySent={(msg) =>
+   796→            setTicket((cur) =>
+   797→              cur
+   798→                ? {
+   799→                    ...cur,
+   800→                    // Customer reply reopens the ticket (server does the same).
+   801→                    status: 'open',
+   802→                    updatedAt: new Date().toISOString(),
+   803→                    messages: [...cur.messages, msg],
+   804→                  }
+   805→                : cur,
+   806→            )
+   807→          }
+   808→          onSwitchToSubmit={onSwitchToSubmit}
+   809→        />
+   810→      )}
+   811→    </div>
+   812→  )
+   813→}
+   814→
+   815→// We need the raw token the customer typed (the API deliberately omits
+   816→// lookupToken from the response — never expose it back). Watch the field
+   817→// via `register` and grab its value when needed for the reply call.
+   818→type TicketDetailCardProps = {
+   819→  ticket: TicketDetail
+   820→  lookupToken: string
+   821→  onReplySent: (msg: TicketMessageView) => void
+   822→  onSwitchToSubmit?: () => void
+   823→}
+   824→
+   825→function TicketDetailCard({
+   826→  ticket,
+   827→  lookupToken,
+   828→  onReplySent,
+   829→  onSwitchToSubmit,
+   830→}: TicketDetailCardProps) {
+   831→  const created = new Date(ticket.createdAt)
+   832→  return (
+   833→    <motion.div
+   834→      initial={{ opacity: 0, y: 8 }}
+   835→      animate={{ opacity: 1, y: 0 }}
+   836→      transition={{ duration: 0.2 }}
+   837→    >
+   838→      <Card className="border-border/60 shadow-sm">
+   839→        <CardHeader>
+   840→          <div className="flex flex-wrap items-start gap-3">
+   841→            <div className="grid gap-1">
+   842→              <CardTitle className="text-lg leading-snug">
+   843→                {ticket.subject}
+   844→              </CardTitle>
+   845→              <CardDescription className="flex flex-wrap items-center gap-x-2 gap-y-1">
+   846→                <span className="font-mono text-xs">{ticket.ref}</span>
+   847→                <span aria-hidden>·</span>
+   848→                <span>Opened {format(created, 'd MMM yyyy, h:mm a')}</span>
+   849→              </CardDescription>
+   850→            </div>
+   851→            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+   852→              <StatusBadge status={ticket.status} />
+   853→              <PriorityBadge priority={ticket.priority} />
+   854→              <CategoryBadge category={ticket.category} />
+   855→            </div>
+   856→          </div>
+   857→        </CardHeader>
+   858→        <CardContent className="grid gap-6">
+   859→          <section className="grid gap-2">
+   860→            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+   861→              Your original message
+   862→            </h3>
+   863→            <pre className="whitespace-pre-wrap break-words rounded-md border border-border/60 bg-muted/30 p-4 font-sans text-sm leading-relaxed">
+   864→              {ticket.body}
+   865→            </pre>
+   866→          </section>
+   867→
+   868→          <section className="grid gap-3" aria-label="Message thread">
+   869→            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+   870→              Conversation ({ticket.messages.length})
+   871→            </h3>
+   872→            <ol className="grid gap-3">
+   873→              {ticket.messages.map((m) => (
+   874→                <li key={m.id}>
+   875→                  <MessageRow
+   876→                    role={m.authorRole}
+   877→                    body={m.body}
+   878→                    createdAt={new Date(m.createdAt)}
+   879→                    aiDrafted={m.aiDrafted}
+   880→                  />
+   881→                </li>
+   882→              ))}
+   883→            </ol>
+   884→          </section>
+   885→
+   886→          {/* Reply box — shown unless the ticket is closed. */}
+   887→          {ticket.status === 'closed' ? (
+   888→            <ClosedTicketNote onSwitchToSubmit={onSwitchToSubmit} />
+   889→          ) : (
+   890→            <ReplyComposer
+   891→              ref_={ticket.ref}
+   892→              lookupToken={lookupToken}
+   893→              onSent={onReplySent}
+   894→            />
+   895→          )}
+   896→        </CardContent>
+   897→      </Card>
+   898→    </motion.div>
+   899→  )
+   900→}
+   901→
+   902→/**
+   903→ * Closed-ticket notice. Tells the customer they can't reply here anymore
+   904→ * and offers a one-tap jump back to the Submit tab so they can file a
+   905→ * fresh ticket without losing context.
+   906→ */
+   907→function ClosedTicketNote({
+   908→  onSwitchToSubmit,
+   909→}: {
+   910→  onSwitchToSubmit?: () => void
+   911→}) {
+   912→  return (
+   913→    <Alert>
+   914→      <TicketIcon className="h-4 w-4 text-muted-foreground" />
+   915→      <AlertTitle>This ticket is closed</AlertTitle>
+   916→      <AlertDescription className="flex flex-col gap-2">
+   917→        <span>
+   918→          If you still need help, please submit a new ticket above — we
+   919→          won&apos;t reopen closed tickets automatically.
+   920→        </span>
+   921→        {onSwitchToSubmit && (
+   922→          <Button
+   923→            type="button"
+   924→            variant="outline"
+   925→            size="sm"
+   926→            className="w-fit"
+   927→            onClick={onSwitchToSubmit}
+   928→          >
+   929→            <MessageSquarePlus className="h-4 w-4" />
+   930→            Submit a new ticket
+   931→          </Button>
+   932→        )}
+   933→      </AlertDescription>
+   934→    </Alert>
+   935→  )
+   936→}
+   937→
+   938→/**
+   939→ * Customer reply composer. Mirrors the staff reply box pattern:
+   940→ *  - Textarea with character counter (`LIMITS.MAX_BODY`).
+   941→ *  - "Send reply" button POSTs to /api/tickets/reply with `{ref, lookupToken, body}`.
+   942→ *  - 201 → optimistic append to the thread, clear the box, success toast.
+   943→ *  - 429 → RetryCountdown (same component the rest of the surface uses).
+   944→ *  - 409 → inline "ticket is closed" notice + hide the composer.
+   945→ *  - 422 → inline field error next to the textarea.
+   946→ *  - 5xx / network → toast error, keep the typed text so the user can retry.
+   947→ *
+   948→ * Note: the API may flip the ticket status from 'resolved' → 'open' on a
+   949→ * successful reply (a customer follow-up on a "resolved" ticket reopens
+   950→ * it). The parent's `onSent` callback handles that state update.
+   951→ */
+   952→function ReplyComposer({
+   953→  ref_,
+   954→  lookupToken,
+   955→  onSent,
+   956→}: {
+   957→  ref_: string
+   958→  lookupToken: string
+   959→  onSent: (msg: TicketMessageView) => void
+   960→}) {
+   961→  const [body, setBody] = useState('')
+   962→  const [sending, setSending] = useState(false)
+   963→  const [fieldError, setFieldError] = useState<string | null>(null)
+   964→  const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
+   965→  const [closed, setClosed] = useState(false)
+   966→
+   967→  const onSend = async () => {
+   968→    const trimmed = body.trim()
+   969→    if (!trimmed || sending || rateLimitReset !== null) return
+   970→    setSending(true)
+   971→    setFieldError(null)
+   972→    try {
+   973→      const res = await fetch('/api/tickets/reply', {
+   974→        method: 'POST',
+   975→        headers: { 'Content-Type': 'application/json' },
+   976→        body: JSON.stringify({
+   977→          ref: ref_,
+   978→          lookupToken,
+   979→          body: trimmed,
+   980→        }),
+   981→      })
+   982→      const payload: unknown = await res.json().catch(() => null)
+   983→
+   984→      if (res.status === 201 && payload && typeof payload === 'object' && 'data' in payload) {
+   985→        const data = (payload as { data: TicketMessageView }).data
+   986→        onSent(data)
+   987→        setBody('')
+   988→        toast.success("Reply sent — we'll get back to you.")
+   989→        return
+   990→      }
+   991→      if (res.status === 422 && payload && typeof payload === 'object' && 'fields' in payload) {
+   992→        const fields = (payload as { fields: FieldErrors }).fields ?? {}
+   993→        setFieldError(fields.body ?? 'Please write a bit more.')
+   994→        return
+   995→      }
+   996→      if (res.status === 409) {
+   997→        // Server says the ticket is now closed (race with a staff close).
+   998→        // Hide the composer and show the closed notice.
+   999→        setClosed(true)
+  1000→        return
+  1001→      }
+  1002→      if (res.status === 429) {
+  1003→        const retryAfter = Number(res.headers.get('Retry-After') ?? '60')
+  1004→        setRateLimitReset(Math.max(1, retryAfter))
+  1005→        return
+  1006→      }
+  1007→      const msg =
+  1008→        payload && typeof payload === 'object' && 'error' in payload
+  1009→          ? String((payload as { error: unknown }).error)
+  1010→          : "We couldn't send your reply. Please try again."
+  1011→      toast.error(msg)
+  1012→    } catch {
+  1013→      toast.error('Network error. Please check your connection and try again.')
+  1014→    } finally {
+  1015→      setSending(false)
+  1016→    }
+  1017→  }
+  1018→
+  1019→  if (closed) {
+  1020→    return <ClosedTicketNote />
+  1021→  }
+  1022→
+  1023→  const disabled = sending || rateLimitReset !== null
+  1024→
+  1025→  return (
+  1026→    <section className="grid gap-3" aria-label="Reply to support">
+  1027→      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+  1028→        Reply
+  1029→      </h3>
+  1030→      <Textarea
+  1031→        id="reply-body"
+  1032→        value={body}
+  1033→        onChange={(e) => {
+  1034→          setBody(e.target.value)
+  1035→          if (fieldError) setFieldError(null)
+  1036→        }}
+  1037→        rows={4}
+  1038→        maxLength={LIMITS.MAX_BODY}
+  1039→        placeholder="Type your reply…"
+  1040→        disabled={disabled}
+  1041→        aria-invalid={!!fieldError}
+  1042→        aria-label="Reply to support"
+  1043→      />
+  1044→      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+  1045→        <span className="text-[11px] text-muted-foreground tabular-nums">
+  1046→          {body.length}/{LIMITS.MAX_BODY}
+  1047→        </span>
+  1048→        <Button
+  1049→          type="button"
+  1050→          size="sm"
+  1051→          onClick={onSend}
+  1052→          disabled={disabled || body.trim().length === 0}
+  1053→        >
+  1054→          {sending ? (
+  1055→            <>
+  1056→              <Loader2 className="h-4 w-4 animate-spin" /> Sending…
+  1057→            </>
+  1058→          ) : (
+  1059→            <>
+  1060→              <Send className="h-4 w-4" /> Send reply
+  1061→            </>
+  1062→          )}
+  1063→        </Button>
+  1064→      </div>
+  1065→      {fieldError && (
+  1066→        <p role="alert" className="text-xs text-destructive">
+  1067→          {fieldError}
+  1068→        </p>
+  1069→      )}
+  1070→      {rateLimitReset !== null && (
+  1071→        <Alert>
+  1072→          <TriangleAlert className="h-4 w-4 text-amber-600" />
+  1073→          <AlertDescription>
+  1074→            You&apos;ve sent a few replies in a row. Please wait{' '}
+  1075→            <RetryCountdown
+  1076→              seconds={rateLimitReset}
+  1077→              onDone={() => setRateLimitReset(null)}
+  1078→            />{' '}
+  1079→            before sending another.
+  1080→          </AlertDescription>
+  1081→        </Alert>
+  1082→      )}
+  1083→    </section>
+  1084→  )
+  1085→}
+  1086→
+  1087→function MessageRow({
+  1088→  role,
+  1089→  body,
+  1090→  createdAt,
+  1091→  aiDrafted,
+  1092→}: {
+  1093→  role: string
+  1094→  body: string
+  1095→  createdAt: Date
+  1096→  aiDrafted: boolean
+  1097→}) {
+  1098→  // Visual treatment per role. Customer = neutral, staff = amber accent,
+  1099→  // AI = emerald accent + AI badge, system = subtle gray italic.
+  1100→  const isStaff = role === 'staff'
+  1101→  const isAi = role === 'ai'
+  1102→  const isSystem = role === 'system'
+  1103→  const isCustomer = role === 'customer'
+  1104→
+  1105→  const authorLabel: Record<string, string> = {
+  1106→    customer: 'You',
+  1107→    staff: 'Support agent',
+  1108→    ai: 'AI assistant',
+  1109→    system: 'System',
+  1110→  }
+  1111→
+  1112→  return (
+  1113→    <div
+  1114→      className={cn(
+  1115→        'rounded-lg border p-3',
+  1116→        isStaff && 'border-amber-200 bg-amber-50/40 dark:border-amber-900 dark:bg-amber-950/10',
+  1117→        isAi && 'border-emerald-200 bg-emerald-50/40 dark:border-emerald-900 dark:bg-emerald-950/10',
+  1118→        isSystem && 'border-dashed border-border/60 bg-muted/20',
+  1119→        isCustomer && 'border-border/60 bg-background',
+  1120→      )}
+  1121→    >
+  1122→      <div className="mb-1.5 flex flex-wrap items-center gap-2">
+  1123→        <span className="inline-flex items-center gap-1 text-xs font-medium">
+  1124→          {isAi && <Bot className="h-3.5 w-3.5 text-emerald-600" />}
+  1125→          {isStaff && <LifeBuoy className="h-3.5 w-3.5 text-amber-600" />}
+  1126→          {isCustomer && <User className="h-3.5 w-3.5 text-muted-foreground" />}
+  1127→          {isSystem && <TicketIcon className="h-3.5 w-3.5 text-muted-foreground" />}
+  1128→          {authorLabel[role] ?? role}
+  1129→        </span>
+  1130→        {isAi && (
+  1131→          <Badge variant="outline" className="border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-400">
+  1132→            AI
+  1133→          </Badge>
+  1134→        )}
+  1135→        {isStaff && aiDrafted && (
+  1136→          <Badge variant="outline" className="border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400">
+  1137→            AI-drafted
+  1138→          </Badge>
+  1139→        )}
+  1140→        <span className="ml-auto text-[11px] text-muted-foreground tabular-nums">
+  1141→          {format(createdAt, 'd MMM, h:mm a')}
+  1142→        </span>
+  1143→      </div>
+  1144→      <pre
+  1145→        className={cn(
+  1146→          'whitespace-pre-wrap break-words font-sans text-sm leading-relaxed',
+  1147→          isSystem && 'italic text-muted-foreground',
+  1148→        )}
+  1149→      >
+  1150→        {body}
+  1151→      </pre>
+  1152→    </div>
+  1153→  )
+  1154→}
+  1155→
+  1156→// ============================================================
+  1157→// Tab 3 — AI chatbot
+  1158→// ============================================================
+  1159→
+  1160→type UiChatMessage = ChatMessage & { id: string; pending?: boolean }
+  1161→
+  1162→function newId(): string {
+  1163→  return Math.random().toString(36).slice(2, 10)
+  1164→}
+  1165→
+  1166→function ChatAssistant() {
+  1167→  const [messages, setMessages] = useState<UiChatMessage[]>([])
+  1168→  const [input, setInput] = useState('')
+  1169→  const [sending, setSending] = useState(false)
+  1170→  const [error, setError] = useState<string | null>(null)
+  1171→  const [rateLimitReset, setRateLimitReset] = useState<number | null>(null)
+  1172→
+  1173→  const listRef = useRef<HTMLDivElement>(null)
+  1174→  const inputRef = useRef<HTMLTextAreaElement>(null)
+  1175→
+  1176→  // Auto-scroll to newest message.
+  1177→  useEffect(() => {
+  1178→    const el = listRef.current
+  1179→    if (el) el.scrollTop = el.scrollHeight
+  1180→  }, [messages, sending])
+  1181→
+  1182→  const send = useCallback(async () => {
+  1183→    const text = input.trim()
+  1184→    if (!text || sending || rateLimitReset !== null) return
+  1185→
+  1186→    setError(null)
+  1187→    const userMsg: UiChatMessage = { id: newId(), role: 'user', content: text }
+  1188→    // Send only role+content to the API (UI-local id is dropped).
+  1189→    const apiMessages: ChatMessage[] = [
+  1190→      ...messages.map((m) => ({ role: m.role, content: m.content })),
+  1191→      { role: 'user', content: text },
+  1192→    ]
+  1193→    setMessages((prev) => [...prev, userMsg])
+  1194→    setInput('')
+  1195→    setSending(true)
+  1196→
+  1197→    try {
+  1198→      const res = await fetch('/api/chat', {
+  1199→        method: 'POST',
+  1200→        headers: { 'Content-Type': 'application/json' },
+  1201→        body: JSON.stringify({ messages: apiMessages }),
+  1202→      })
+  1203→      const payload: unknown = await res.json().catch(() => null)
+  1204→      if (res.ok && payload && typeof payload === 'object' && 'data' in payload) {
+  1205→        const data = (payload as { data: ChatResult }).data
+  1206→        if (data.reply) {
+  1207→          setMessages((prev) => [
+  1208→            ...prev,
+  1209→            { id: newId(), role: 'assistant', content: data.reply as string },
+  1210→          ])
+  1211→        } else {
+  1212→          // AI unavailable — graceful fallback message in-thread.
+  1213→          setMessages((prev) => [
+  1214→            ...prev,
+  1215→            {
+  1216→              id: newId(),
+  1217→              role: 'assistant',
+  1218→              content:
+  1219→                "I'm having trouble responding right now. Please submit a ticket above and an agent will follow up.",
+  1220→            },
+  1221→          ])
+  1222→        }
+  1223→        return
+  1224→      }
+  1225→      if (res.status === 429) {
+  1226→        const retryAfter = Number(res.headers.get('Retry-After') ?? '60')
+  1227→        setRateLimitReset(Math.max(1, retryAfter))
+  1228→        return
+  1229→      }
+  1230→      setError("I'm having trouble responding right now. Please try again in a moment.")
+  1231→    } catch {
+  1232→      setError('Network error. Please check your connection and try again.')
+  1233→    } finally {
+  1234→      setSending(false)
+  1235→      // Refocus the input for follow-up questions.
+  1236→      requestAnimationFrame(() => inputRef.current?.focus())
+  1237→    }
+  1238→  }, [input, messages, sending, rateLimitReset])
+  1239→
+  1240→  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+  1241→    if (e.key === 'Enter' && !e.shiftKey) {
+  1242→      e.preventDefault()
+  1243→      void send()
+  1244→    }
+  1245→  }
+  1246→
+  1247→  const disabled = sending || rateLimitReset !== null
+  1248→  const empty = messages.length === 0
+  1249→
+  1250→  return (
+  1251→    <Card className="border-border/60 shadow-sm">
+  1252→      <CardHeader>
+  1253→        <CardTitle className="flex items-center gap-2 text-lg">
+  1254→          <Sparkles className="h-5 w-5 text-emerald-600" />
+  1255→          Help me now
+  1256→        </CardTitle>
+  1257→        <CardDescription>
+  1258→          Ask our assistant a quick question — it can help with common issues
+  1259→          before an agent picks up.
+  1260→        </CardDescription>
+  1261→      </CardHeader>
+  1262→      <CardContent>
+  1263→        <Alert className="mb-4">
+  1264→          <Bot className="h-4 w-4" />
+  1265→          <AlertTitle>Heads up</AlertTitle>
+  1266→          <AlertDescription>
+  1267→            This assistant doesn&apos;t know your account or billing details.
+  1268→            For anything sensitive, submit a ticket above and an agent will
+  1269→            follow up.
+  1270→          </AlertDescription>
+  1271→        </Alert>
+  1272→
+  1273→        {/* Conversation */}
+  1274→        <div
+  1275→          ref={listRef}
+  1276→          aria-live="polite"
+  1277→          aria-label="Conversation with assistant"
+  1278→          className={cn(
+  1279→            'mb-3 max-h-96 min-h-48 overflow-y-auto rounded-lg border border-border/60 bg-muted/20 p-3',
+  1280→            '[&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent',
+  1281→          )}
+  1282→        >
+  1283→          {empty ? (
+  1284→            <div className="grid h-48 place-items-center text-center text-sm text-muted-foreground">
+  1285→              <div className="grid gap-2">
+  1286→                <Bot className="mx-auto h-8 w-8 text-emerald-600" />
+  1287→                <p>Ask me anything — like &ldquo;How do I reset my password?&rdquo;</p>
+  1288→              </div>
+  1289→            </div>
+  1290→          ) : (
+  1291→            <ul className="grid gap-3">
+  1292→              {messages.map((m) => (
+  1293→                <li
+  1294→                  key={m.id}
+  1295→                  className={cn(
+  1296→                    'flex',
+  1297→                    m.role === 'user' ? 'justify-end' : 'justify-start',
+  1298→                  )}
+  1299→                >
+  1300→                  <div
+  1301→                    className={cn(
+  1302→                      'max-w-[85%] rounded-2xl px-3.5 py-2 text-sm leading-relaxed',
+  1303→                      m.role === 'user'
+  1304→                        ? 'bg-primary text-primary-foreground'
+  1305→                        : 'border border-emerald-200 bg-emerald-50 text-foreground dark:border-emerald-900 dark:bg-emerald-950/30',
+  1306→                    )}
+  1307→                  >
+  1308→                    {m.role === 'assistant' && (
+  1309→                      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-400">
+  1310→                        <Bot className="h-3 w-3" />
+  1311→                        Assistant
+  1312→                      </div>
+  1313→                    )}
+  1314→                    <p className="whitespace-pre-wrap break-words">{m.content}</p>
+  1315→                  </div>
+  1316→                </li>
+  1317→              ))}
+  1318→              {sending && (
+  1319→                <li className="flex justify-start">
+  1320→                  <div className="flex items-center gap-1.5 rounded-2xl border border-emerald-200 bg-emerald-50 px-3.5 py-2.5 dark:border-emerald-900 dark:bg-emerald-950/30">
+  1321→                    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+  1322→                    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500 [animation-delay:150ms]" />
+  1323→                    <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-500 [animation-delay:300ms]" />
+  1324→                    <span className="sr-only">Assistant is typing</span>
+  1325→                  </div>
+  1326→                </li>
+  1327→              )}
+  1328→            </ul>
+  1329→          )}
+  1330→        </div>
+  1331→
+  1332→        {/* Errors */}
+  1333→        <AnimatePresence>
+  1334→          {error && (
+  1335→            <motion.div
+  1336→              initial={{ opacity: 0, y: -4 }}
+  1337→              animate={{ opacity: 1, y: 0 }}
+  1338→              exit={{ opacity: 0 }}
+  1339→              className="mb-3"
+  1340→            >
+  1341→              <Alert variant="destructive">
+  1342→                <AlertCircle className="h-4 w-4" />
+  1343→                <AlertDescription>{error}</AlertDescription>
+  1344→              </Alert>
+  1345→            </motion.div>
+  1346→          )}
+  1347→          {rateLimitReset !== null && (
+  1348→            <div className="mb-3">
+  1349→              <Alert>
+  1350→                <TriangleAlert className="h-4 w-4 text-amber-600" />
+  1351→                <AlertDescription>
+  1352→                  Please wait{' '}
+  1353→                  <RetryCountdown
+  1354→                    seconds={rateLimitReset}
+  1355→                    onDone={() => setRateLimitReset(null)}
+  1356→                  />{' '}
+  1357→                  before sending another message.
+  1358→                </AlertDescription>
+  1359→              </Alert>
+  1360→            </div>
+  1361→          )}
+  1362→        </AnimatePresence>
+  1363→
+  1364→        {/* Composer */}
+  1365→        <div className="flex items-end gap-2">
+  1366→          <Textarea
+  1367→            ref={inputRef}
+  1368→            value={input}
+  1369→            onChange={(e) => setInput(e.target.value)}
+  1370→            onKeyDown={onKeyDown}
+  1371→            rows={2}
+  1372→            placeholder="Type your question…  (Enter to send, Shift+Enter for a new line)"
+  1373→            disabled={disabled}
+  1374→            className="min-h-12 max-h-48 resize-y"
+  1375→            aria-label="Message to assistant"
+  1376→          />
+  1377→          <Button
+  1378→            type="button"
+  1379→            onClick={send}
+  1380→            disabled={disabled || !input.trim()}
+  1381→            aria-label="Send message"
+  1382→            className="h-auto shrink-0 self-stretch"
+  1383→          >
+  1384→            {sending ? (
+  1385→              <Loader2 className="h-4 w-4 animate-spin" />
+  1386→            ) : (
+  1387→              <Send className="h-4 w-4" />
+  1388→            )}
+  1389→            <span className="sr-only sm:not-sr-only sm:ml-1">Send</span>
+  1390→          </Button>
+  1391→        </div>
+  1392→      </CardContent>
+  1393→    </Card>
+  1394→  )
+  1395→}
+  1396→
+  1397→// ============================================================
+  1398→// Top-level portal
+  1399→// ============================================================
+  1400→
+  1401→type Tab = 'submit' | 'lookup' | 'chat'
+  1402→
+  1403→export function CustomerPortal() {
+  1404→  const [tab, setTab] = useState<Tab>('submit')
+  1405→  // When a ticket is submitted, we hand its ref+token to the lookup tab so
+  1406→  // the customer can jump straight to viewing it without retyping.
+  1407→  const [prefill, setPrefill] = useState<{ ref: string; token: string } | null>(null)
+  1408→  // Bump on each prefill to force the lookup form to remount with the new
+  1409→  // defaults (and re-trigger its auto-fetch effect).
+  1410→  const [lookupNonce, setLookupNonce] = useState(0)
+  1411→
+  1412→  const handleSubmitted = (result: SubmitResult) => {
+  1413→    setPrefill({ ref: result.ref, token: result.lookupToken })
+  1414→    setLookupNonce((n) => n + 1)
+  1415→    setTab('lookup')
+  1416→  }
+  1417→
+  1418→  return (
+  1419→    <section className="container mx-auto max-w-3xl px-4 py-8 sm:px-6 sm:py-10">
+  1420→      {/* Hero */}
+  1421→      <div className="mb-6 grid gap-1.5 text-center sm:mb-8">
+  1422→        <div className="mx-auto inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-0.5 text-[11px] font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-400">
+  1423→          <LifeBuoy className="h-3 w-3" />
+  1424→          Customer support
+  1425→        </div>
+  1426→        <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
+  1427→          How can we help?
+  1428→        </h1>
+  1429→        <p className="mx-auto max-w-xl text-sm text-muted-foreground">
+  1430→          Submit a ticket, check on one you&apos;ve already opened, or chat with
+  1431→          our assistant. No account needed.
+  1432→        </p>
+  1433→      </div>
+  1434→
+  1435→      <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)} className="grid gap-6">
+  1436→        <TabsList className="grid w-full grid-cols-3 h-auto">
+  1437→          <TabsTrigger value="submit" className="flex-col gap-1 py-2 text-xs sm:flex-row sm:text-sm">
+  1438→            <MessageSquarePlus className="h-4 w-4" />
+  1439→            <span>Submit</span>
+  1440→          </TabsTrigger>
+  1441→          <TabsTrigger value="lookup" className="flex-col gap-1 py-2 text-xs sm:flex-row sm:text-sm">
+  1442→            <Search className="h-4 w-4" />
+  1443→            <span>Status</span>
+  1444→          </TabsTrigger>
+  1445→          <TabsTrigger value="chat" className="flex-col gap-1 py-2 text-xs sm:flex-row sm:text-sm">
+  1446→            <Sparkles className="h-4 w-4" />
+  1447→            <span>Help me now</span>
+  1448→          </TabsTrigger>
+  1449→        </TabsList>
+  1450→
+  1451→        <TabsContent value="submit" className="outline-none">
+  1452→          <SubmitTicketForm onSubmitted={handleSubmitted} />
+  1453→        </TabsContent>
+  1454→
+  1455→        <TabsContent value="lookup" className="outline-none">
+  1456→          {/* `key` forces remount on each new prefill so the form picks up
+  1457→              the new defaults and re-runs its auto-fetch effect. */}
+  1458→          <LookupTicketForm
+  1459→            key={lookupNonce}
+  1460→            prefillRef={prefill?.ref}
+  1461→            prefillToken={prefill?.token}
+  1462→            onSwitchToSubmit={() => setTab('submit')}
+  1463→          />
+  1464→        </TabsContent>
+  1465→
+  1466→        <TabsContent value="chat" className="outline-none">
+  1467→          <ChatAssistant />
+  1468→        </TabsContent>
+  1469→      </Tabs>
+  1470→    </section>
+  1471→  )
+  1472→}
+  1473→

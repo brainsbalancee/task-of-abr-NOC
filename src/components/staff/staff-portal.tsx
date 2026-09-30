@@ -28,7 +28,10 @@ import { toast } from 'sonner'
 import {
   ArrowLeft,
   CheckCircle2,
+  ChevronDown,
   ClipboardCopy,
+  Clock,
+  History,
   Inbox,
   Loader2,
   LogOut,
@@ -38,6 +41,8 @@ import {
   Sparkles,
   TriangleAlert,
   UserCircle2,
+  UserPlus,
+  UserX,
 } from 'lucide-react'
 
 import {
@@ -69,10 +74,24 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import { LIMITS } from '@/lib/sanitize'
+import { formatDurationMs } from '@/lib/sla'
 
 import type {
+  CustomerHistoryEntry,
   DraftResult,
   PatchTicketRequest,
   QueueStats,
@@ -83,6 +102,7 @@ import type {
   StaffRole,
   StaffTicketDetail,
   StaffUser,
+  StaffUserSummary,
   TicketCategory,
   TicketPriority,
   TicketStatus,
@@ -150,6 +170,31 @@ function CategoryBadge({ category }: { category: TicketCategory }) {
     >
       {CATEGORY_LABELS[category]}
     </Badge>
+  )
+}
+
+/**
+ * Stale badge — small red dot on queue rows whose ticket matches one of
+ * the "falling through the cracks" rules. The full reason is shown in a
+ * tooltip on hover/focus so the row stays compact on mobile.
+ */
+function StaleBadge({ reason }: { reason: string | null }) {
+  return (
+    <TooltipProvider delayDuration={200}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge
+            variant="outline"
+            className="cursor-help border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400"
+          >
+            <TriangleAlert className="h-3 w-3" /> Stale
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">
+          {reason ?? 'Ticket matches a staleness rule.'}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   )
 }
 
@@ -283,6 +328,7 @@ export function StaffPortal() {
         ticketId={selectedTicketId}
         staff={staff}
         onBack={closeTicket}
+        onOpenTicket={openTicket}
       />
     )
   }
@@ -501,6 +547,11 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
   const [category, setCategory] = useState<'all' | TicketCategory>('all')
   const [q, setQ] = useState('')
   const [assignee, setAssignee] = useState<'all' | 'me' | 'unassigned'>('all')
+  // "Stale only" client-side filter — when on, hides tickets whose
+  // `stale` flag is false. We do this client-side (not via query string)
+  // because the queue payload already carries the stale flag and we want
+  // the dashboard cards to keep reflecting the full queue state.
+  const [staleOnly, setStaleOnly] = useState(false)
 
   const [data, setData] = useState<StaffListResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -598,7 +649,17 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
     pending: 0,
     resolvedToday: 0,
     unassigned: 0,
+    medianFirstResponseMsToday: 0,
+    oldestUnassignedAgeMs: 0,
+    staleCount: 0,
   }
+
+  // Apply the "Stale only" client-side filter on top of whatever the
+  // server returned. Done client-side (not via query string) so the
+  // stats cards always reflect the true queue state.
+  const visibleTickets = staleOnly
+    ? (data?.tickets ?? []).filter((t) => t.stale)
+    : (data?.tickets ?? [])
 
   return (
     <section className="container mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
@@ -650,7 +711,7 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
       </div>
 
       {/* Stats row */}
-      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
+      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-4 lg:grid-cols-6">
         <StatCard
           label="Open"
           value={stats.open}
@@ -672,6 +733,19 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
         <StatCard
           label="Unassigned"
           value={stats.unassigned}
+          accent="red"
+          icon={<TriangleAlert className="h-4 w-4" />}
+        />
+        <StatTextCard
+          label="Median first reply"
+          value={formatDurationMs(stats.medianFirstResponseMsToday)}
+          sub="today"
+          accent="emerald"
+          icon={<Clock className="h-4 w-4" />}
+        />
+        <StatCard
+          label="Stale tickets"
+          value={stats.staleCount}
           accent="red"
           icon={<TriangleAlert className="h-4 w-4" />}
         />
@@ -762,9 +836,9 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
         </div>
       </div>
 
-      {/* Search box */}
-      <div className="mt-3">
-        <div className="relative">
+      {/* Search box + stale toggle */}
+      <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="relative flex-1">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             id="filter-search"
@@ -775,13 +849,28 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
             className="pl-9"
           />
         </div>
+        <label
+          htmlFor="filter-stale"
+          className="inline-flex shrink-0 items-center gap-2 rounded-md border border-border/60 bg-card px-3 py-2 text-xs font-medium cursor-pointer select-none hover:bg-accent transition-colors"
+        >
+          <Switch
+            id="filter-stale"
+            checked={staleOnly}
+            onCheckedChange={setStaleOnly}
+            aria-label="Show only stale tickets"
+          />
+          <span className="inline-flex items-center gap-1">
+            <TriangleAlert className="h-3.5 w-3.5 text-red-600" />
+            Stale only
+          </span>
+        </label>
       </div>
 
       {/* Ticket table / mobile cards */}
       <div className="mt-5">
         {loading && !data ? (
           <QueueSkeleton />
-        ) : data && data.tickets.length > 0 ? (
+        ) : visibleTickets.length > 0 ? (
           <>
             {/* Desktop: table */}
             <div className="hidden rounded-lg border border-border/60 bg-card md:block">
@@ -791,15 +880,15 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
                     <TableHead className="w-[110px]">Ref</TableHead>
                     <TableHead>Subject</TableHead>
                     <TableHead className="w-[200px]">Customer</TableHead>
-                    <TableHead className="w-[110px]">Status</TableHead>
-                    <TableHead className="w-[100px]">Priority</TableHead>
+                    <TableHead className="w-[140px]">Status</TableHead>
+                    <TableHead className="w-[110px]">Priority</TableHead>
                     <TableHead className="w-[130px]">Category</TableHead>
                     <TableHead className="w-[140px]">Opened</TableHead>
                     <TableHead className="w-[140px]">Assignee</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {data.tickets.map((t) => (
+                  {visibleTickets.map((t) => (
                     <QueueRow
                       key={t.id}
                       ticket={t}
@@ -812,7 +901,7 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
 
             {/* Mobile: stacked cards */}
             <div className="grid gap-2 md:hidden">
-              {data.tickets.map((t) => (
+              {visibleTickets.map((t) => (
                 <QueueCard
                   key={t.id}
                   ticket={t}
@@ -822,7 +911,8 @@ function QueueView({ staff, onOpenTicket, onLogout }: QueueViewProps) {
             </div>
 
             <p className="mt-3 text-center text-xs text-muted-foreground">
-              Showing {data.tickets.length} of {data.total} tickets
+              Showing {visibleTickets.length}
+              {staleOnly ? ' stale' : ''} of {data?.total ?? 0} tickets
             </p>
           </>
         ) : (
@@ -874,6 +964,54 @@ function StatCard({
   )
 }
 
+/**
+ * Stat card whose value is a string (e.g. "12m 30s") rather than a count.
+ * Used for the median first-reply card. Same visual treatment as StatCard.
+ */
+function StatTextCard({
+  label,
+  value,
+  sub,
+  accent,
+  icon,
+}: {
+  label: string
+  value: string
+  sub?: string
+  accent: 'emerald' | 'amber' | 'zinc' | 'red'
+  icon: React.ReactNode
+}) {
+  const accentCls: Record<typeof accent, string> = {
+    emerald:
+      'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-400',
+    amber:
+      'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-400',
+    zinc: 'border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300',
+    red: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-400',
+  } as const
+  return (
+    <div
+      className={cn(
+        'flex items-center gap-3 rounded-lg border px-3 py-2.5 sm:px-4',
+        accentCls[accent],
+      )}
+    >
+      <div className="flex h-9 w-9 items-center justify-center rounded-md bg-background/70">
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <div className="text-base font-semibold tabular-nums sm:text-lg">
+          {value}
+        </div>
+        <div className="truncate text-[11px] uppercase tracking-wide opacity-80">
+          {label}
+          {sub ? <span className="opacity-70"> · {sub}</span> : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function QueueRow({
   ticket,
   onClick,
@@ -893,11 +1031,14 @@ function QueueRow({
         }
       }}
       role="button"
-      aria-label={`Open ticket ${ticket.ref}: ${ticket.subject}`}
+      aria-label={`Open ticket ${ticket.ref}: ${ticket.subject}${ticket.stale ? ' (stale)' : ''}`}
     >
       <TableCell className="font-mono text-xs">{ticket.ref}</TableCell>
       <TableCell className="max-w-[280px]">
-        <div className="truncate font-medium">{ticket.subject}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="truncate font-medium">{ticket.subject}</span>
+          {ticket.stale && <StaleBadge reason={ticket.staleReason} />}
+        </div>
         <div className="text-[11px] text-muted-foreground">
           {ticket._count.messages} message{ticket._count.messages === 1 ? '' : 's'}
         </div>
@@ -961,6 +1102,7 @@ function QueueCard({
         <StatusBadge status={ticket.status} />
         <PriorityBadge priority={ticket.priority} />
         <CategoryBadge category={ticket.category} />
+        {ticket.stale && <StaleBadge reason={ticket.staleReason} />}
       </div>
       <div className="mt-2 flex items-center justify-between text-[11px] text-muted-foreground">
         <span>{ticket._count.messages} messages</span>
@@ -1026,10 +1168,12 @@ function TicketDetailView({
   ticketId,
   staff,
   onBack,
+  onOpenTicket,
 }: {
   ticketId: string
   staff: StaffUser
   onBack: () => void
+  onOpenTicket: (id: string) => void
 }) {
   const [ticket, setTicket] = useState<StaffTicketDetail | null>(null)
   const [loading, setLoading] = useState(true)
@@ -1043,8 +1187,36 @@ function TicketDetailView({
   // Reset on send or on manual clear.
   const [draftFromAI, setDraftFromAI] = useState(false)
 
-  // Patch-in-flight state for optimistic UI on status/priority/etc.
+  // Patch-in-progress state for optimistic UI on status/priority/etc.
   const [patching, setPatching] = useState(false)
+
+  // Staff user list for the "Assign to..." dropdown. Fetched once on mount
+  // of the ticket detail view and cached. We don't refetch when switching
+  // tickets — the staff list rarely changes during a session.
+  const [staffUsers, setStaffUsers] = useState<StaffUserSummary[]>([])
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch('/api/staff/users', { cache: 'no-store' })
+        if (!res.ok) return
+        const payload = (await res.json()) as
+          | { ok: true; data: { users: StaffUserSummary[] } }
+          | { users: StaffUserSummary[] }
+        const users =
+          'ok' in (payload as unknown as Record<string, unknown>)
+            ? (payload as unknown as { data: { users: StaffUserSummary[] } }).data.users
+            : (payload as { users: StaffUserSummary[] }).users
+        if (!cancelled) setStaffUsers(users)
+      } catch {
+        // Best-effort — the dropdown just won't populate.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const fetchTicket = useCallback(async () => {
     try {
@@ -1191,7 +1363,13 @@ function TicketDetailView({
   }
 
   // ---- Patch (status / priority / category / assign) ------------------
-  const patchTicket = async (patch: PatchTicketRequest) => {
+  // `successMsg` lets assignment call sites show "Assigned to {name}"
+  // rather than the generic "Ticket updated." — small UX touch that
+  // makes handoff to a colleague feel real.
+  const patchTicket = async (
+    patch: PatchTicketRequest,
+    successMsg?: string,
+  ) => {
     if (!ticket) return
     setPatching(true)
     const prev = ticket
@@ -1211,9 +1389,19 @@ function TicketDetailView({
           name: staff.name,
           role: staff.role as StaffRole,
         }
+      } else if (staffUsers.length > 0) {
+        // Optimistically reflect a re-assignment to another staff member.
+        const match = staffUsers.find((u) => u.id === patch.assigneeId)
+        if (match) {
+          next.assignee = {
+            id: match.id,
+            name: match.name,
+            role: match.role,
+          }
+        }
       }
-      // If patch.assigneeId is some other id (we never send that from this UI),
-      // we leave prev.assignee alone and let the server's response reconcile.
+      // If we couldn't find the assignee in the local staff list, we leave
+      // prev.assignee alone and let the server's response reconcile.
     }
     setTicket(next)
     try {
@@ -1236,7 +1424,15 @@ function TicketDetailView({
         | null
       if (res.ok && payload && 'data' in payload) {
         setTicket(payload.data)
-        toast.success('Ticket updated.')
+        // For assignment, surface the resolved name (it's in the server
+        // response) so the toast is accurate even if we couldn't optimise.
+        if (patch.assigneeId !== undefined && successMsg) {
+          const a = payload.data.assignee
+          const name = a ? a.name : 'no one'
+          toast.success(successMsg.replace('{name}', name))
+        } else {
+          toast.success(successMsg ?? 'Ticket updated.')
+        }
       } else {
         // Revert on failure.
         setTicket(prev)
@@ -1343,67 +1539,104 @@ function TicketDetailView({
               <span className="text-xs font-medium text-muted-foreground">
                 Assignee
               </span>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Badge
                   variant="outline"
                   className="border-zinc-200 bg-zinc-50 text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300"
                 >
-                  {ticket.assignee ? ticket.assignee.name : 'Unassigned'}
+                  {ticket.assignee
+                    ? ticket.assignee.id === staff.id
+                      ? 'Assigned to you'
+                      : `Assigned to ${ticket.assignee.name}`
+                    : 'Unassigned'}
                 </Badge>
-                {ticket.assignee?.id !== staff.id ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => void patchTicket({ assigneeId: staff.id })}
-                    disabled={patching}
-                  >
-                    Assign to me
-                  </Button>
-                ) : (
+                {ticket.assignee?.id === staff.id ? (
                   <Button
                     variant="ghost"
                     size="sm"
-                    onClick={() => void patchTicket({ assigneeId: null })}
+                    onClick={() =>
+                      void patchTicket(
+                        { assigneeId: null },
+                        'Ticket unassigned.',
+                      )
+                    }
                     disabled={patching}
                   >
+                    <UserX className="h-4 w-4" />
                     Unassign
                   </Button>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      void patchTicket(
+                        { assigneeId: staff.id },
+                        'Assigned to {name}.',
+                      )
+                    }
+                    disabled={patching}
+                  >
+                    <UserPlus className="h-4 w-4" />
+                    {ticket.assignee ? 'Reassign to me' : 'Assign to me'}
+                  </Button>
                 )}
+                {/* "Assign to..." / "Reassign to..." dropdown for handoff
+                    to a colleague. Calls the existing PATCH endpoint with
+                    the chosen staff id — no new write endpoint needed. */}
+                <Select
+                  value=""
+                  onValueChange={(v) => {
+                    if (v && v !== '__none__') {
+                      void patchTicket(
+                        { assigneeId: v },
+                        'Assigned to {name}.',
+                      )
+                    }
+                  }}
+                  disabled={patching || staffUsers.length === 0}
+                >
+                  <SelectTrigger
+                    aria-label={ticket.assignee ? 'Reassign to colleague' : 'Assign to colleague'}
+                    className="h-8 w-auto gap-1 px-2 text-xs"
+                  >
+                    <span className="text-muted-foreground">
+                      {ticket.assignee ? 'Reassign to…' : 'Assign to…'}
+                    </span>
+                    <ChevronDown className="h-3 w-3 opacity-60" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {staffUsers.length === 0 ? (
+                      <SelectItem value="__none__" disabled>
+                        Loading…
+                      </SelectItem>
+                    ) : (
+                      staffUsers.map((u) => (
+                        <SelectItem
+                          key={u.id}
+                          value={u.id}
+                          // Don't offer the current user here — they have a
+                          // dedicated "Assign to me" button above.
+                          disabled={u.id === staff.id}
+                        >
+                          {u.name}{' '}
+                          <span className="text-muted-foreground">· {u.role}</span>
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
           </div>
 
-          {/* Customer */}
-          <div className="grid gap-1.5 rounded-md border border-border/60 bg-muted/30 p-3">
-            <span className="text-xs font-medium text-muted-foreground">
-              Customer
-            </span>
-            <div className="flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="truncate text-sm font-medium">
-                  {ticket.customerName ?? 'Anonymous'}
-                </div>
-                <div className="truncate text-xs text-muted-foreground">
-                  {ticket.customerEmail}
-                </div>
-              </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(ticket.customerEmail)
-                    toast.success('Email copied to clipboard.')
-                  } catch {
-                    toast.error('Could not copy. Please copy manually.')
-                  }
-                }}
-              >
-                <ClipboardCopy className="h-4 w-4" />
-                Copy email
-              </Button>
-            </div>
-          </div>
+          {/* Customer + history context */}
+          <CustomerContextCard
+            customerName={ticket.customerName}
+            customerEmail={ticket.customerEmail}
+            history={ticket.customerHistory ?? []}
+            onOpenTicket={onOpenTicket}
+          />
 
           {/* Original ticket body */}
           <div className="grid gap-1.5">
@@ -1651,5 +1884,134 @@ function TicketDetailSkeleton({ onBack }: { onBack: () => void }) {
       </div>
       <Skeleton className="mt-5 h-40 w-full" />
     </section>
+  )
+}
+
+// ============================================================
+// Customer context card — customer + their other tickets
+// ============================================================
+
+type CustomerContextCardProps = {
+  customerName: string | null
+  customerEmail: string
+  history: CustomerHistoryEntry[]
+  onOpenTicket: (id: string) => void
+}
+
+/**
+ * Compact customer context panel shown in the ticket detail view. Lets the
+ * answering staff see at a glance who they're talking to and whether this
+ * is a recurring issue or a high-touch customer — without leaving the
+ * screen.
+ *
+ * Layout: header (name + email + copy button), then a collapsible section
+ * listing up to 5 other tickets by the same customer (newest first). The
+ * section defaults to collapsed so it doesn't push the reply box offscreen
+ * on mobile; one tap expands it.
+ *
+ * Each row shows ref (mono), subject (truncated), status badge, created
+ * date, last-updated date. Click → switches to that ticket's detail view.
+ */
+function CustomerContextCard({
+  customerName,
+  customerEmail,
+  history,
+  onOpenTicket,
+}: CustomerContextCardProps) {
+  const [open, setOpen] = useState(false)
+
+  return (
+    <div className="grid gap-1.5 rounded-md border border-border/60 bg-muted/30 p-3">
+      <span className="text-xs font-medium text-muted-foreground">
+        Customer
+      </span>
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-medium">
+            {customerName ?? 'Anonymous'}
+          </div>
+          <div className="truncate text-xs text-muted-foreground">
+            {customerEmail}
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(customerEmail)
+              toast.success('Email copied to clipboard.')
+            } catch {
+              toast.error('Could not copy. Please copy manually.')
+            }
+          }}
+        >
+          <ClipboardCopy className="h-4 w-4" />
+          Copy email
+        </Button>
+      </div>
+
+      <Collapsible open={open} onOpenChange={setOpen} className="mt-2">
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full items-center gap-1.5 rounded-md border border-border/60 bg-background px-2.5 py-1.5 text-left text-xs font-medium hover:bg-accent transition-colors"
+            aria-expanded={open}
+            aria-controls="customer-history-list"
+          >
+            <History className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="truncate">
+              Other tickets from {customerEmail}
+            </span>
+            <Badge
+              variant="outline"
+              className="ml-1 border-zinc-200 bg-zinc-50 text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400"
+            >
+              {history.length}
+            </Badge>
+            <ChevronDown
+              className={cn(
+                'ml-auto h-3.5 w-3.5 text-muted-foreground transition-transform',
+                open && 'rotate-180',
+              )}
+            />
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent id="customer-history-list" className="mt-2">
+          {history.length === 0 ? (
+            <p className="rounded-md border border-dashed border-border/60 bg-background px-2.5 py-2 text-[11px] text-muted-foreground">
+              No other tickets from this customer.
+            </p>
+          ) : (
+            <ul className="grid gap-1.5">
+              {history.map((h) => (
+                <li key={h.id}>
+                  <button
+                    type="button"
+                    onClick={() => onOpenTicket(h.id)}
+                    className="grid w-full gap-0.5 rounded-md border border-border/60 bg-background px-2.5 py-2 text-left hover:bg-accent transition-colors"
+                    aria-label={`Open ${h.ref}: ${h.subject}`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-mono text-[11px] text-muted-foreground">
+                        {h.ref}
+                      </span>
+                      <StatusBadge status={h.status} />
+                    </div>
+                    <div className="truncate text-xs font-medium">
+                      {h.subject}
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      Opened {format(new Date(h.createdAt), 'd MMM yyyy')} ·
+                      Updated {formatDistanceToNow(new Date(h.updatedAt), { addSuffix: true })}
+                    </div>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
   )
 }

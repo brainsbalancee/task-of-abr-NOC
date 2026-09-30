@@ -35,11 +35,21 @@ The dev server prints to `dev.log` as well as stdout. If the page doesn't render
 bun run lint
 ```
 
+### Tests
+
+```bash
+bun test
+```
+
+67 tests across 4 files: unit tests for `computeStaleness` (the staleness pure function), `validateTicketInput` / `validateMessageBody` (input sanitization), and `hashPassword` / `verifyPassword` / `signSessionToken` / `verifySessionToken` (auth); plus one 9-step full-workflow integration test that exercises customer-submit → customer-lookup → customer-reply → staff-login → staff-list → staff-detail → staff-reply → staff-AI-draft → customer-looks-up-again-and-sees-the-staff-reply.
+
+Tests use a separate `db/test.db` database so they never touch the demo DB the reviewer sees. See [tests/README.md](./tests/README.md) for what we chose NOT to test and why.
+
 ---
 
 ## Demo accounts
 
-The seed script creates two staff accounts and three sample tickets:
+The seed script creates two staff accounts and twelve sample tickets across six company domains:
 
 | Role  | Email                      | Password           |
 | ----- | -------------------------- | ------------------- |
@@ -54,16 +64,18 @@ The staff login screen has one-click buttons that pre-fill these for you, so you
 2. Click **Submit a ticket**. Fill in subject, details, email, optional name, category, priority. Submit.
 3. You get a **ticket reference** (e.g. `HD-5NC22B`) and a **lookup token** (an 80-character unguessable string). Save both — we don't email them in this build, and we can't recover them if you lose them.
 4. Click **View my ticket** to switch to the status tab and see your ticket, the conversation thread, and any staff replies.
-5. Or click **Help me now** to chat with the AI assistant for quick self-service. The assistant doesn't know your account or billing details.
+5. If you need to add information after submitting, use the **Add a reply** box at the bottom of the ticket view. Your reply lands in the same thread and the ticket pops back to the top of the staff queue.
+6. Or click **Help me now** to chat with the AI assistant for quick self-service. The assistant doesn't know your account or billing details.
 
 ### How to use it as staff
 
 1. Toggle to **Staff** in the header.
 2. Sign in with one of the demo accounts (one-click buttons do this for you).
-3. You land on the **queue** — a live list of tickets, filterable by status / priority / category / assignee / search. Stats row shows Open / Awaiting reply / Resolved today / Unassigned.
-4. Click any ticket to open the **detail view**: customer's original message, full conversation thread, status/priority/category dropdowns, and an "Assign to me" button.
-5. In the reply box, either type your reply or click **Suggest a reply ✨** to let the AI draft one. The draft fills the box — review, edit, and click **Send reply**. The draft is never sent automatically; staff always have the final word.
-6. Sending a reply flips the ticket to "Awaiting reply" (pending) status — the staff member is now waiting on the customer.
+3. You land on the **queue** — a live list of tickets, filterable by status / priority / category / assignee / search. Stats row shows Open / Awaiting reply / Resolved today / Unassigned / **Median first reply (today)** / **Stale tickets**.
+4. The staleness rules ("nothing falls through the cracks") are: unassigned>1h, no staff reply>4h, open-inactive>24h, pending-inactive>72h. There's a "Show only stale" filter for end-of-shift handoff.
+5. Click any ticket to open the **detail view**: customer's original message, full conversation thread, status/priority/category dropdowns, and an "Assign to me" button.
+6. In the reply box, either type your reply or click **Suggest a reply ✨** to let the AI draft one. The draft fills the box — review, edit, and click **Send reply**. The draft is never sent automatically; staff always have the final word.
+7. Sending a reply flips the ticket to "Awaiting reply" (pending) status — the staff member is now waiting on the customer. When the customer replies back, the ticket pops to "open" and back to the top of the queue.
 
 ---
 

@@ -1,0 +1,10 @@
+# bunfig.toml — bun configuration
+#
+# Docs: https://bun.sh/docs/runtime/bunfig
+
+[test]
+# Run tests/setup.ts before any test file. The preload sets
+# DATABASE_URL=file:./db/test.db so the workflow test doesn't pollute
+# the demo DB the reviewer sees in the Preview Panel. See the file for
+# the full rationale.
+preload = ["./tests/setup.ts"]
